@@ -1,0 +1,31 @@
+[package]
+name = "mockllm"
+description = "Mock LLM providers over real HTTP: OpenAI Chat Completions and Anthropic Messages, with their request rules, per-model quirks and exact framing."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lihe07/mockllm"
+keywords = ["llm", "mock", "openai", "anthropic", "testing"]
+categories = ["development-tools::testing"]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[dependencies]
+axum = "0.8"
+bytes = "1"
+futures = "0.3"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
