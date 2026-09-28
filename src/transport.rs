@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
@@ -139,6 +139,14 @@ pub(crate) async fn socket(
         let turn = session.event(body, &mut || script.next());
         if !play(&mut ws, turn).await {
             // Dropped without a close frame: the connection just ends.
+            return;
+        }
+        if let Some((code, reason)) = session.close() {
+            let frame = CloseFrame {
+                code,
+                reason: reason.into(),
+            };
+            let _ = ws.send(Message::Close(Some(frame))).await;
             return;
         }
     }

@@ -81,6 +81,10 @@ src/
     mod.rs          Gemini: API key, Google's error shape
     generate.rs     POST /v1beta/models/{model}:generateContent and
                     :streamGenerateContent       (+ generate_models.rs)
+    embed.rs        POST /v1beta/models/{model}:embedContent and
+                    :batchEmbedContents          (table inline)
+    live.rs         GET  /ws/...BidiGenerateContent, WebSocket
+    interactions.rs POST /v1beta/interactions (and /v1)
 tests/<provider>_<endpoint>.rs, tests/transports.rs
 ```
 
@@ -100,6 +104,12 @@ pub trait Endpoint<P> {
     fn validate(&self, provider: &P, req: &Request) -> Result<(), Rejection>;
     fn respond(&self, provider: &P, req: &Request, answer: &Answer, ctx: &Ctx) -> Out; // HTTP
     fn session(&self, provider: &P, req: &Request) -> Option<Box<dyn Session>>;     // WebSocket
+}
+
+pub trait Session {
+    fn open(&mut self, ctx: &Ctx) -> Vec<Value>;                      // events on connect
+    fn event(&mut self, event: Value, next: &mut dyn FnMut() -> Answer) -> Turn;
+    fn close(&mut self) -> Option<(u16, String)>;  // after a turn: a close frame ends it
 }
 
 pub enum Out {
@@ -158,6 +168,53 @@ status, `retry-after`.
   with `finishReason` and usage; without `alt=sse`, one JSON array sent a
   response at a time; a mid-stream error as the bare error JSON; errors as
   `{"error": {"code", "message", "status"}}`.
+- **Gemini embeddings** (`gemini/embed.rs`,
+  [reference](https://ai.google.dev/api/embeddings)): `content` required;
+  unknown fields rejected, by camelCase or proto snake_case name (the
+  [guide](https://ai.google.dev/gemini-api/docs/embeddings)'s REST example
+  sends `output_dimensionality`); settings in `embedContentConfig` or the
+  deprecated top-level twins; `taskType` one of `TaskType`;
+  `outputDimensionality` per model, 3072 values by default;
+  `{"embedding": {"values"}}` with `usageMetadata.promptTokenCount`;
+  `:batchEmbedContents` with `requests[]` required, each request's `model`
+  the path's, one `embeddings[]` entry per request.
+- **Gemini Live** (`gemini/live.rs`, WebSocket,
+  [reference](https://ai.google.dev/api/live),
+  [WebSocket guide](https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket),
+  [capabilities](https://ai.google.dev/gemini-api/docs/live-api/capabilities)):
+  `?key=`; exactly one of `setup`, `clientContent`, `realtimeInput`,
+  `toolResponse` per message; `setup` first and only first, with `model`,
+  answered `{"setupComplete": {}}`; a response to `clientContent` with
+  `turnComplete: true`, to `realtimeInput` `text`, `activityEnd` or
+  `audioStreamEnd`, and to `toolResponse`: `serverContent.modelTurn`
+  messages (`text` parts with `responseModalities: ["TEXT"]`, in
+  `generationConfig` or at the top of `setup` as the guide's example has
+  it; otherwise `inlineData` `audio/pcm;rate=24000` chunks, with
+  `outputTranscription` when `outputAudioTranscription` is set), then
+  `generationComplete`, then `turnComplete` with a sibling `usageMetadata`;
+  `toolCall.functionCalls` with ids. Invalid messages and scripted errors
+  close the connection: 1007 invalid, 1008 client errors, 1011 server
+  errors and `error_after` (codes and reasons commonly seen; the docs give
+  none).
+- **Gemini Interactions** (`gemini/interactions.rs`,
+  [reference](https://ai.google.dev/api/interactions-api),
+  [OpenAPI](https://ai.google.dev/static/api/interactions.openapi.json),
+  [streaming](https://ai.google.dev/gemini-api/docs/interactions/streaming)):
+  `/v1beta` and `/v1`; exactly one of `model` and `agent`, and only that
+  mode's fields (`generation_config` or `agent_config`); unknown fields
+  rejected; `response_mime_type` required with `response_format`;
+  `service_tier`, `thinking_level`, `thinking_summaries` enums; an
+  `Interaction` with `steps` (`model_output` text or image content,
+  `function_call` with status `requires_action`, a `thought` step with a
+  signature for `Answer::reasoning`, its `summary` with
+  `thinking_summaries: auto`) and `usage`; `stream: true` as named events
+  (`event:` equal to the payload's `event_type`): `interaction.created`,
+  `interaction.status_update`, `step.start`/`step.delta`/`step.stop` per
+  step (text per word, `arguments_delta` JSON pieces), `interaction.completed`
+  without steps, then `event: done` / `data: [DONE]`; mid-stream `event:
+  error` as in the guide. Errors keep the provider's shape: the OpenAPI
+  spec's `{"error": {"code": "<string>", "message"}}` is not confirmed for
+  HTTP errors, and no error wording is documented.
 
 ### Per-model rules
 
@@ -198,6 +255,7 @@ one commonly seen from the API.
 | Claude, while thinking | no prefill; `temperature` only 1, no `top_k`, `top_p` >= 0.95 (older models) | thinking limits |
 | `gemini-2.0-flash` | max output 8,192; no `thinkingLevel` | [model page](https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash), [`ThinkingConfig`](https://ai.google.dev/api/generate-content) |
 | `gemini-2.5-pro`, `-flash`, `-flash-lite` | max output 65,536; no `thinkingLevel`; thinking on (off on Flash-Lite) | model pages, `ThinkingConfig`, [thinking](https://ai.google.dev/gemini-api/docs/thinking) |
+| `gemini-embedding-001`, `gemini-embedding-2` | `outputDimensionality` 128..=3072 | [embeddings, model versions](https://ai.google.dev/gemini-api/docs/embeddings#model-versions) |
 | `gemini-3-*`, `gemini-3.x-*` | max output 65,536; thinking on; `thinkingLevel` values per model (`low`/`high` on 3 Pro, `low`..`high` on 3.1 Pro, 3.7 and 3.8 Flash, `minimal`..`high` otherwise) | model pages, thinking |
 
 ### Quirks of OpenAI-compatible providers
@@ -258,10 +316,12 @@ they need already exist.
 | Anthropic Message Batches, `/v1/messages/batches` | `anthropic/batches.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/messages/batches) |
 | Anthropic models, `GET /v1/models` | `anthropic/models.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/models/list) |
 | Anthropic files, `/v1/files` | `anthropic/files.rs` | multipart | [reference](https://platform.claude.com/docs/en/api/files-create) |
-| Gemini embeddings, `:embedContent` | `gemini/embed.rs` | `Answer::embedding` | [reference](https://ai.google.dev/api/embeddings) |
-| Gemini Live (WebSocket) | `gemini/live.rs` | `Session` | [guide](https://ai.google.dev/gemini-api/docs/live), [reference](https://ai.google.dev/api/live) |
-| Gemini Imagen, `:predict` | `gemini/imagen.rs` | `Answer::image` | [guide](https://ai.google.dev/gemini-api/docs/imagen) |
-| Gemini Interactions API | `gemini/interactions.rs` | JSON, named SSE | [guide](https://ai.google.dev/gemini-api/docs/interactions) |
+| Gemini Live: session resumption, `goAway`, input transcription, interruptions | `gemini/live.rs` | `Session` | [reference](https://ai.google.dev/api/live) |
+
+Not planned: Gemini Imagen `:predict`. "Imagen models are shut down ...
+no longer available in the Gemini API"
+([guide](https://ai.google.dev/gemini-api/docs/imagen)); the docs no
+longer describe the endpoint.
 
 ## License
 
