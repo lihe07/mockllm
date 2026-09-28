@@ -5,8 +5,11 @@
 mod chat;
 mod chat_models;
 mod embeddings;
+mod image_edits;
 mod images;
 mod realtime;
+mod speech;
+mod transcriptions;
 
 use serde_json::{Map, Value, json};
 
@@ -37,6 +40,9 @@ impl Provider for OpenAi {
             Box::new(embeddings::Embeddings),
             Box::new(images::Images),
             Box::new(realtime::Realtime),
+            Box::new(speech::Speech),
+            Box::new(transcriptions::Transcriptions),
+            Box::new(image_edits::ImageEdits),
         ]
     }
 

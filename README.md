@@ -23,7 +23,9 @@ openai.answer(Answer::text("Hi there"));
 openai.answer(Answer::tool_call("get_weather", json!({ "city": "Paris" })));
 openai.answer(Answer::text("Hi").reasoning("hidden thoughts"));
 openai.answer(Answer::embedding(vec![0.1, 0.2]));    // /v1/embeddings
-openai.answer(Answer::image(png_bytes));             // /v1/images/generations
+openai.answer(Answer::image(png_bytes));             // /v1/images/generations, /edits
+openai.answer(Answer::audio(mp3_bytes));             // /v1/audio/speech
+openai.answer(Answer::transcript("Hello"));          // /v1/audio/transcriptions
 openai.answer(Answer::events(vec![json!({ "type": "custom" })])); // raw SSE or WebSocket events
 openai.answer(Answer::error(429).retry_after(7));    // provider's error shape
 
@@ -72,7 +74,11 @@ src/
                     the endpoint list
     chat.rs         POST /v1/chat/completions   (+ chat_models.rs)
     embeddings.rs   POST /v1/embeddings          (table inline)
-    images.rs       POST /v1/images/generations  (table inline)
+    images.rs       POST /v1/images/generations  (table inline; JSON and
+                    the named-SSE stream shared with image_edits.rs)
+    image_edits.rs  POST /v1/images/edits        (multipart or JSON)
+    speech.rs       POST /v1/audio/speech        (table inline)
+    transcriptions.rs POST /v1/audio/transcriptions (multipart; table inline)
     realtime.rs     GET  /v1/realtime, WebSocket
   anthropic/
     mod.rs          Anthropic: x-api-key, anthropic-version, error shape
@@ -134,8 +140,46 @@ status, `retry-after`.
 - **OpenAI Images, generations** (`openai/images.rs`): `prompt` required,
   `n` 1..=10 and 1 on `dall-e-3`, sizes per model, `url` (served by the
   mock) or `b64_json`, GPT image models always base64, no
-  `response_format`, with `usage`; `revised_prompt` on `dall-e-3`. Image
-  streaming is not modelled yet.
+  `response_format`, with `usage`; `revised_prompt` on `dall-e-3`.
+  `stream: true` (GPT image models only; without `model` it picks one):
+  named SSE events, `partial_images` (0..=3)
+  `image_generation.partial_image`s with `partial_image_index`, then
+  `image_generation.completed` with `usage`; each carries `size`,
+  `quality`, `background`, `output_format`, `created_at` ([streaming
+  events](https://developers.openai.com/api/reference/resources/images/generation-streaming-events)).
+- **OpenAI Images, edits** (`openai/image_edits.rs`): multipart with
+  `image` / `image[]` and `mask` file parts, or JSON with `images`
+  references (GPT image models only); `prompt` and an image required;
+  default model `gpt-image-1.5`; `dall-e-2` one square PNG, prompt <= 1000
+  chars, its sizes, `url` or `b64_json`; GPT image models up to 16
+  PNG/WebP/JPEG images, prompt <= 32000, base64 only; mask PNG; `n`
+  1..=10 (form text too); no `dall-e-3`; streaming as generations with
+  `image_edit.*` events ([reference](https://developers.openai.com/api/reference/resources/images/methods/edit),
+  [streaming events](https://developers.openai.com/api/reference/resources/images/edit-streaming-events)).
+- **OpenAI speech** (`openai/speech.rs`): `model`, `input` (<= 4096
+  chars), `voice` (a built-in name or `{ "id" }`) required; `speed`
+  0.25..=4; `response_format` `mp3` (default) / `opus` / `aac` / `flac` /
+  `wav` / `pcm` as `audio/mpeg`, `audio/opus`, `audio/aac`, `audio/flac`,
+  `audio/wav`, `audio/pcm`, always chunked (1024-byte chunks, so `pace`
+  and `cut_after` apply per chunk); `stream_format: "sse"` as `data:`
+  events `speech.audio.delta` (base64 `audio`) then `speech.audio.done`
+  with `usage`. Unscripted: 0.1 s of silence (a silent MP3 frame, a WAV,
+  raw PCM; other formats get raw PCM, not decodable)
+  ([reference](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create),
+  events and content types from the [OpenAPI spec](https://github.com/openai/openai-openapi)).
+- **OpenAI transcriptions** (`openai/transcriptions.rs`, multipart):
+  `file` and `model` required, the file's extension among the listed
+  audio formats, over 25 MB a 413; `response_format` `json` (text and
+  usage, tokens or duration per model), `text` / `srt` / `vtt` as
+  `text/plain` (one cue), `verbose_json` (`segments` by default, `words`
+  with `timestamp_granularities[]=word`; repeated `[]` fields are read),
+  `diarized_json`; `include[]=logprobs` (with `json` only); `temperature`
+  0..=1; `stream: true` as `data:` events `transcript.text.delta` per
+  word, `transcript.text.segment` when diarized (deltas with
+  `segment_id`), then `transcript.text.done` with usage; `languages` from
+  `gpt-transcribe` ([reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create),
+  [streaming events](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/streaming-events),
+  [guide](https://developers.openai.com/api/docs/guides/speech-to-text)).
 - **OpenAI Realtime** (`openai/realtime.rs`, WebSocket): `session.created`
   on connect, `session.update` to `session.updated`, `response.create` to
   `response.created`, `output_item.added`, `content_part.added`,
@@ -183,7 +227,13 @@ one commonly seen from the API.
 | `gpt-6-sol`, `gpt-6-luna` | sampling and function calling only at effort `none` | [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model) |
 | `text-embedding-3-small`, `-3-large` | 1536 / 3072 dimensions by default | [embeddings guide](https://developers.openai.com/api/docs/guides/embeddings) |
 | `text-embedding-ada-002` | `dimensions` rejected | [embeddings reference](https://developers.openai.com/api/reference/resources/embeddings/methods/create) |
-| `dall-e-2`, `dall-e-3`, `gpt-image-*` | sizes; `n` = 1 on `dall-e-3`; GPT image: base64 only, no `response_format` | [images reference](https://developers.openai.com/api/reference/resources/images/methods/generate) |
+| `dall-e-2`, `dall-e-3`, `gpt-image-*` | sizes; `n` = 1 on `dall-e-3`; GPT image: base64 only, no `response_format`; `stream` only on GPT image | [images reference](https://developers.openai.com/api/reference/resources/images/methods/generate) |
+| `dall-e-2`, `gpt-image-*` (edits) | `dall-e-2`: one PNG, prompt 1000 chars, multipart only; GPT image: 16 images, prompt 32000; no `dall-e-3` | [edit reference](https://developers.openai.com/api/reference/resources/images/methods/edit) |
+| `tts-1`, `tts-1-hd` | no `stream_format: "sse"`; voices `alloy`, `ash`, `coral`, `echo`, `fable`, `onyx`, `nova`, `sage`, `shimmer` only | [speech reference](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create), [TTS guide](https://developers.openai.com/api/docs/guides/text-to-speech#voice-options) |
+| `whisper-1` | formats `json`/`text`/`srt`/`verbose_json`/`vtt`; `stream` ignored; timestamp granularities; no logprobs; billed by duration | [transcription reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create), [guide](https://developers.openai.com/api/docs/guides/speech-to-text) |
+| `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | `json` only; logprobs | transcription reference |
+| `gpt-4o-transcribe-diarize` | `json`/`text`/`diarized_json`; no `prompt`, `include`, timestamp granularities | transcription reference |
+| `gpt-transcribe` | returns `languages`; no logprobs, no timestamp granularities | transcription reference, guide |
 | `claude-fable-5-1`, `claude-mythos-5-1`, `claude-opus-5-5` | thinking always on (`enabled`, `disabled` rejected); forced tool use rejected | [thinking troubleshooting](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting), [errors](https://platform.claude.com/docs/en/api/errors) |
 | `claude-fable-5`, `claude-mythos-5` | thinking always on | thinking troubleshooting |
 | `claude-opus-5`, `claude-sonnet-5` | thinking on by default, `enabled` rejected | thinking troubleshooting |
@@ -247,10 +297,6 @@ they need already exist.
 | Endpoint | File | Needs | Docs |
 |---|---|---|---|
 | OpenAI Responses, `POST /v1/responses` | `openai/responses.rs` | JSON, named SSE | [reference](https://developers.openai.com/api/reference/resources/responses/methods/create), [streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events) |
-| OpenAI speech, `POST /v1/audio/speech` | `openai/speech.rs` | `Answer::audio`, `Out::Bytes` / `Out::Chunks` | [reference](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create) |
-| OpenAI transcriptions, `POST /v1/audio/transcriptions` | `openai/transcriptions.rs` | multipart, `Answer::transcript`, SSE | [reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create) |
-| OpenAI image edits, `POST /v1/images/edits` | `openai/image_edits.rs` | multipart, `Answer::image` | [reference](https://developers.openai.com/api/reference/resources/images/methods/edit) |
-| OpenAI image streaming (`stream: true`) | `openai/images.rs` | named SSE | [image generation guide](https://developers.openai.com/api/docs/guides/image-generation) |
 | OpenAI files, `/v1/files` | `openai/files.rs` | multipart, `Ctx::host` | [reference](https://developers.openai.com/api/reference/resources/files) |
 | OpenAI batch, `/v1/batches` | `openai/batches.rs` | JSON | [reference](https://developers.openai.com/api/reference/resources/batches) |
 | Realtime audio, tools, conversation items | `openai/realtime.rs` | WebSocket, `Answer::audio` | [server events](https://developers.openai.com/api/reference/resources/realtime/server-events) |
