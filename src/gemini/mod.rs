@@ -1,8 +1,11 @@
 //! Google Gemini API: what its endpoints share (the API key, the error
 //! shape), and the endpoints, one file each.
 
+mod embed;
 mod generate;
 mod generate_models;
+mod interactions;
+mod live;
 
 use serde_json::{Value, json};
 
@@ -24,6 +27,10 @@ impl Provider for Gemini {
         vec![
             Box::new(generate::Generate { stream: false }),
             Box::new(generate::Generate { stream: true }),
+            Box::new(embed::Embed { batch: false }),
+            Box::new(embed::Embed { batch: true }),
+            Box::new(live::Live),
+            Box::new(interactions::Interactions),
         ]
     }
 

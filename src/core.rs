@@ -93,6 +93,13 @@ pub trait Session: Send + 'static {
     /// One client event in. `next` takes the next queued [`Answer`], for
     /// events that ask for a response.
     fn event(&mut self, event: Value, next: &mut dyn FnMut() -> Answer) -> Turn;
+
+    /// Asked after each turn is sent: a close code and reason ends the
+    /// connection with that close frame, as providers that report errors
+    /// by closing do.
+    fn close(&mut self) -> Option<(u16, String)> {
+        None
+    }
 }
 
 /// What a [`Session`] sends back for one client event.
