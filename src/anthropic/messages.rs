@@ -40,7 +40,7 @@ impl Endpoint<Anthropic> for Messages {
 
 /// The body, and whether a thinking block shows its text (`None` when
 /// the model does not think on this request).
-fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Rejection> {
+pub(crate) fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Rejection> {
     let Some(body) = req.body.as_object() else {
         return Err(bad("There was an error parsing the body of your request."));
     };
@@ -74,7 +74,7 @@ fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Reject
     Ok((body, show))
 }
 
-fn check_messages(messages: &[Value]) -> Result<(), Rejection> {
+pub(crate) fn check_messages(messages: &[Value]) -> Result<(), Rejection> {
     let mut open: Vec<String> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or_default();
@@ -280,7 +280,7 @@ struct Block {
     deltas: Vec<Value>,
 }
 
-fn respond(
+pub(crate) fn respond(
     anthropic: &Anthropic,
     body: &Map<String, Value>,
     show: Option<bool>,

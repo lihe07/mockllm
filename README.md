@@ -86,6 +86,12 @@ src/
   anthropic/
     mod.rs          Anthropic: x-api-key, anthropic-version, error shape
     messages.rs     POST /v1/messages            (+ messages_models.rs)
+    count_tokens.rs POST /v1/messages/count_tokens
+    batches.rs      /v1/messages/batches: create, list, retrieve,
+                    cancel, delete, results (JSONL)
+    models.rs       GET  /v1/models, /v1/models/{model_id}
+    files.rs        /v1/files: upload (multipart), list, retrieve,
+                    delete, download
   gemini/
     mod.rs          Gemini: API key, Google's error shape
     generate.rs     POST /v1beta/models/{model}:generateContent and
@@ -261,6 +267,44 @@ status, `retry-after`.
   `ping`, `input_json_delta` (opening with an empty one), `thinking` blocks
   with `signature_delta`, `event: error` mid-stream, `request_id` in error
   bodies, 529 `overloaded_error`.
+- **Anthropic count tokens** (`anthropic/count_tokens.rs`): `model` and
+  `messages` required, the reference's parameter list (so `max_tokens` is
+  an extra input), the Messages role rules, `{"input_tokens"}` counted
+  over messages, system and tools; `Answer::events([body])` sets the body.
+  [reference](https://platform.claude.com/docs/en/api/messages/count_tokens)
+- **Anthropic Message Batches** (`anthropic/batches.rs`): `requests` of 1
+  to 100,000, `custom_id` matching `^[a-zA-Z0-9_-]{1,64}$` and unique,
+  413 over 256 MB; created `in_progress`, ended at the first retrieve or
+  list, `canceling` after a cancel then every request `canceled`;
+  `request_counts` zero until ended, `results_url` once ended; each
+  request's `params` checked by the Messages rules and the batch ones
+  (`stream: true`, `speed`, `max_tokens: 0`) asynchronously, as `errored`
+  results in the error shape; results as JSONL, a line per chunk (so
+  `pace`/`cut_after` apply), only once ended; delete only once ended;
+  the queued `Answer` is every succeeded message; raw events are result
+  lines. [reference](https://platform.claude.com/docs/en/api/messages/batches/create),
+  [guide](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
+- **Anthropic models** (`anthropic/models.rs`): the current and legacy
+  models newest first, `max_input_tokens`/`max_tokens` from the Messages
+  table, `created_at` the epoch where the docs give no date, aliases of
+  dated ids resolved, `before_id`/`after_id`/`limit` (1..=1000) paging
+  with `has_more`, `first_id`, `last_id`; 404 for an unknown id.
+  [list](https://platform.claude.com/docs/en/api/models/list),
+  [retrieve](https://platform.claude.com/docs/en/api/models/retrieve),
+  [overview](https://platform.claude.com/docs/en/models/overview)
+- **Anthropic files** (`anthropic/files.rs`): multipart `file`, the
+  final path component kept, `unnamed.<ext>` for no name, the type
+  detected when the part has none, `expires_in_seconds` 3600..=7776000,
+  invalid filenames, 413 over 500 MB; GA shapes (`expires_at` always,
+  `{data, next_page}` with `page` or up to 100 `ids[]`, `before_id` and
+  `after_id` rejected) and, with `anthropic-beta: files-api-2025-04-14`,
+  the beta ones (no `expires_at`, `{data, has_more, first_id, last_id}`,
+  the part's `Content-Type` required); `file_deleted`; download of an
+  uploaded file a 400; ``File `id` not found.`` 404s.
+  [upload](https://platform.claude.com/docs/en/api/files/upload),
+  [list](https://platform.claude.com/docs/en/api/files/list),
+  [delete](https://platform.claude.com/docs/en/api/files/delete),
+  [guide](https://platform.claude.com/docs/en/build-with-claude/files)
 - **Gemini generateContent** (`gemini/generate.rs`): the model from the
   path, `x-goog-api-key` or `?key=`, `contents` required, roles `user` and
   `model`, `candidates` with `finishReason` and `usageMetadata`,
@@ -336,10 +380,13 @@ one commonly seen from the API.
   kinds it frames and return `misfit(..)` for the rest. Then one line in
   the provider's `endpoints()` in `mod.rs`, and
   `tests/<provider>_<endpoint>.rs`. Nothing else changes: auth, errors,
-  recording, the queue and timing are already there. An endpoint over a
-  resource (`/v1/files`, `/v1/files/{id}`, ...) lists its routes in
-  `routes`; state it keeps (the stored files) lives in its struct, made in
-  `endpoints()` and shared from there (files with batches).
+  recording, the queue and timing are already there. A resource with
+  several routes (`/v1/files`, `/v1/files/{id}`, ...) is one file too,
+  either way: one struct listing all its routes in `routes` (OpenAI files
+  and batches), or one struct per route returned by the file's
+  `endpoints()` and added with one `extend` line (Anthropic batches and
+  files). State it keeps (the stored files) lives in a store made in
+  `endpoints()` and shared from there (OpenAI files with batches).
 - **A provider**: `src/<provider>/mod.rs` with a unit struct implementing
   `Provider` (base path, auth, error shape, scripted error table, request
   id header), `pub type Fake<Name> = Mock<Name>;`, its endpoints as
@@ -367,10 +414,6 @@ they need already exist.
 
 | Endpoint | File | Needs | Docs |
 |---|---|---|---|
-| Anthropic count tokens, `POST /v1/messages/count_tokens` | `anthropic/count_tokens.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/messages/count_tokens) |
-| Anthropic Message Batches, `/v1/messages/batches` | `anthropic/batches.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/messages/batches) |
-| Anthropic models, `GET /v1/models` | `anthropic/models.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/models/list) |
-| Anthropic files, `/v1/files` | `anthropic/files.rs` | multipart | [reference](https://platform.claude.com/docs/en/api/files-create) |
 | Gemini embeddings, `:embedContent` | `gemini/embed.rs` | `Answer::embedding` | [reference](https://ai.google.dev/api/embeddings) |
 | Gemini Live (WebSocket) | `gemini/live.rs` | `Session` | [guide](https://ai.google.dev/gemini-api/docs/live), [reference](https://ai.google.dev/api/live) |
 | Gemini Imagen, `:predict` | `gemini/imagen.rs` | `Answer::image` | [guide](https://ai.google.dev/gemini-api/docs/imagen) |
