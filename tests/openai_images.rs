@@ -80,3 +80,57 @@ async fn validation_follows_the_reference() {
     let r = generate(&openai, body).await;
     assert_eq!((r.status, r.error().0.as_str()), (400, "unknown_parameter"));
 }
+
+#[tokio::test]
+async fn stream_sends_named_partial_images_then_completed() {
+    let openai = FakeOpenAi::start().await;
+    openai.answer(Answer::image(b"final".to_vec()));
+    let body = json!({ "model": "gpt-image-1", "prompt": "an otter", "stream": true, "partial_images": 1, "quality": "high" });
+    let r = generate(&openai, body.clone()).await;
+    assert!(
+        r.header("content-type")
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let want = [
+        "image_generation.partial_image",
+        "image_generation.completed",
+    ];
+    assert_eq!(r.events(), want);
+    let events = r.chunks();
+    assert_eq!(events[0]["type"], "image_generation.partial_image");
+    assert_eq!(events[0]["partial_image_index"], 0);
+    assert_eq!(events[0]["quality"], "high");
+    let b64 = events[1]["b64_json"].as_str().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    assert_eq!(bytes, b"final");
+    assert!(events[1]["usage"]["total_tokens"].is_u64());
+    assert!(events[1]["created_at"].is_u64());
+    // Without a model, `stream` picks a GPT image model; no partials by default.
+    let r = generate(&openai, json!({ "prompt": "x", "stream": true })).await;
+    assert_eq!(r.events(), ["image_generation.completed"]);
+    openai.answer(Answer::image(b"x".to_vec()).cut_after(1));
+    let r = generate(&openai, body).await;
+    assert_eq!(r.events(), ["image_generation.partial_image"]);
+    assert!(r.ended.is_err());
+}
+
+#[tokio::test]
+async fn stream_is_for_gpt_image_models() {
+    let openai = FakeOpenAi::start().await;
+    let r = generate(
+        &openai,
+        json!({ "model": "dall-e-3", "prompt": "x", "stream": true }),
+    )
+    .await;
+    assert_eq!((r.status, r.error().0.as_str()), (400, "unsupported_value"));
+    let body =
+        json!({ "model": "gpt-image-1", "prompt": "x", "stream": true, "partial_images": 4 });
+    let r = generate(&openai, body).await;
+    assert_eq!(
+        (r.status, r.error().0.as_str()),
+        (400, "integer_above_max_value")
+    );
+}
