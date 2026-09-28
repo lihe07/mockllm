@@ -7,6 +7,7 @@ mod chat_models;
 mod embeddings;
 mod images;
 mod realtime;
+mod responses;
 
 use serde_json::{Map, Value, json};
 
@@ -37,6 +38,7 @@ impl Provider for OpenAi {
             Box::new(embeddings::Embeddings),
             Box::new(images::Images),
             Box::new(realtime::Realtime),
+            Box::new(responses::Responses),
         ]
     }
 
