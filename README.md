@@ -74,6 +74,8 @@ src/
     embeddings.rs   POST /v1/embeddings          (table inline)
     images.rs       POST /v1/images/generations  (table inline)
     realtime.rs     GET  /v1/realtime, WebSocket
+    files.rs        /v1/files: upload, list, retrieve, content, delete
+    batches.rs      /v1/batches: create, list, retrieve, cancel
   anthropic/
     mod.rs          Anthropic: x-api-key, anthropic-version, error shape
     messages.rs     POST /v1/messages            (+ messages_models.rs)
@@ -97,6 +99,7 @@ pub trait Provider {
 
 pub trait Endpoint<P> {
     fn route(&self) -> (&'static str, &'static str); // ("POST", "/v1beta/models/{model}:generateContent")
+    fn routes(&self) -> Vec<(&'static str, &'static str)>; // default: [route()]; a resource's several
     fn validate(&self, provider: &P, req: &Request) -> Result<(), Rejection>;
     fn respond(&self, provider: &P, req: &Request, answer: &Answer, ctx: &Ctx) -> Out; // HTTP
     fn session(&self, provider: &P, req: &Request) -> Option<Box<dyn Session>>;     // WebSocket
@@ -138,11 +141,50 @@ status, `retry-after`.
   streaming is not modelled yet.
 - **OpenAI Realtime** (`openai/realtime.rs`, WebSocket): `session.created`
   on connect, `session.update` to `session.updated`, `response.create` to
-  `response.created`, `output_item.added`, `content_part.added`,
-  `output_text.delta`s (output modality `text`; `output_audio_transcript`
-  events and no audio bytes for `audio`, the default), the `.done` events
-  and `response.done` with usage; an `error` event for a client event
-  without `type`. Other client events are accepted without a reply.
+  `response.created`, `output_item.added`, `conversation.item.added`,
+  then per answer: a text as `content_part.added` and `output_text.delta`s
+  (output modality `text`; `output_audio_transcript` events for `audio`,
+  the default); `Answer::audio` as base64 `output_audio.delta`s and
+  `output_audio.done`; `Answer::tool_call` as a `function_call` item with
+  `function_call_arguments.delta`s and `.done` (`name`, `call_id`); then
+  the `.done` events, `conversation.item.done` and `response.done` with
+  usage. `conversation.item.create` to `conversation.item.added` and
+  `.done` with `previous_item_id` (not an assistant audio message);
+  `input_audio_buffer.append` (no reply), `.commit` (an error when empty,
+  else `input_audio_buffer.committed` and the user audio item), `.clear`
+  to `.cleared`. `error` events for a missing or unknown event `type` and
+  broken rules, with the client's `event_id`. Other client events of the
+  reference are accepted without a reply; server VAD is not modelled.
+  Sources: [client events](https://developers.openai.com/api/reference/resources/realtime/client-events),
+  [server events](https://developers.openai.com/api/reference/resources/realtime/server-events).
+- **OpenAI Files** (`openai/files.rs`): kept in the mock. Upload as
+  multipart with `file` and `purpose` required, `purpose` one of
+  `assistants`, `batch`, `fine-tune`, `vision`, `user_data`, `evals`;
+  `expires_after[anchor]` `created_at` and `[seconds]` 3600..=2592000;
+  512 MB per file; `batch` and `fine-tune` only `.jsonl`, `batch` up to
+  200 MB and expiring after 30 days by default. List with `after`,
+  `limit` 1..=10,000, `order`, `purpose`, and `first_id`/`last_id`/
+  `has_more`; retrieve; content as the raw bytes; delete to the
+  `FileDeleted` object; a 404 for an unknown id.
+  Source: [files reference](https://developers.openai.com/api/reference/resources/files).
+- **OpenAI Batch** (`openai/batches.rs`): create with `input_file_id`,
+  `endpoint` (the reference's eight), `completion_window` `24h` required;
+  the input file must exist and have purpose `batch`; `metadata` 16
+  pairs, keys up to 64 and values up to 512 characters;
+  `output_expires_after`. Each retrieve moves the batch one status on:
+  `validating`, then `failed` with `errors` (`empty_file`,
+  `too_many_tasks` over 50,000, `invalid_json_line`,
+  `duplicate_custom_id`, `url_mismatch`, `model_mismatch`) or
+  `in_progress`, `finalizing`, `completed`, each with its timestamp and
+  `request_counts`. Each input line runs through the mock's own endpoint
+  for its `url`, rules included, taking the answer queued for the create:
+  status 200 lines go to the output file, others (with the endpoint's
+  error body) to the error file, both of purpose `batch_output` and read
+  through the files endpoints; `usage` sums the requests'. Cancel to
+  `cancelling`, then `cancelled` (a 409 once done). List with `after` and
+  `limit` 1..=100 (default 20).
+  Sources: [batches reference](https://developers.openai.com/api/reference/resources/batches),
+  [Batch guide](https://developers.openai.com/api/docs/guides/batch).
 - **Anthropic Messages** (`anthropic/messages.rs`): `anthropic-version`
   and `max_tokens` required, no `system` role, temperature in 0..=1,
   non-empty content, tool-use/result pairing, named SSE events with
@@ -218,7 +260,10 @@ one commonly seen from the API.
   kinds it frames and return `misfit(..)` for the rest. Then one line in
   the provider's `endpoints()` in `mod.rs`, and
   `tests/<provider>_<endpoint>.rs`. Nothing else changes: auth, errors,
-  recording, the queue and timing are already there.
+  recording, the queue and timing are already there. An endpoint over a
+  resource (`/v1/files`, `/v1/files/{id}`, ...) lists its routes in
+  `routes`; state it keeps (the stored files) lives in its struct, made in
+  `endpoints()` and shared from there (files with batches).
 - **A provider**: `src/<provider>/mod.rs` with a unit struct implementing
   `Provider` (base path, auth, error shape, scripted error table, request
   id header), `pub type Fake<Name> = Mock<Name>;`, its endpoints as
@@ -251,9 +296,6 @@ they need already exist.
 | OpenAI transcriptions, `POST /v1/audio/transcriptions` | `openai/transcriptions.rs` | multipart, `Answer::transcript`, SSE | [reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create) |
 | OpenAI image edits, `POST /v1/images/edits` | `openai/image_edits.rs` | multipart, `Answer::image` | [reference](https://developers.openai.com/api/reference/resources/images/methods/edit) |
 | OpenAI image streaming (`stream: true`) | `openai/images.rs` | named SSE | [image generation guide](https://developers.openai.com/api/docs/guides/image-generation) |
-| OpenAI files, `/v1/files` | `openai/files.rs` | multipart, `Ctx::host` | [reference](https://developers.openai.com/api/reference/resources/files) |
-| OpenAI batch, `/v1/batches` | `openai/batches.rs` | JSON | [reference](https://developers.openai.com/api/reference/resources/batches) |
-| Realtime audio, tools, conversation items | `openai/realtime.rs` | WebSocket, `Answer::audio` | [server events](https://developers.openai.com/api/reference/resources/realtime/server-events) |
 | Anthropic count tokens, `POST /v1/messages/count_tokens` | `anthropic/count_tokens.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/messages/count_tokens) |
 | Anthropic Message Batches, `/v1/messages/batches` | `anthropic/batches.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/messages/batches) |
 | Anthropic models, `GET /v1/models` | `anthropic/models.rs` | JSON | [reference](https://platform.claude.com/docs/en/api/models/list) |

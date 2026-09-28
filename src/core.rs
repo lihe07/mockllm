@@ -61,6 +61,12 @@ pub trait Endpoint<P>: Send + Sync + 'static {
     /// `("POST", "/v1beta/models/{model}:generateContent")`.
     fn route(&self) -> (&'static str, &'static str);
 
+    /// Every method and path served, for an endpoint over a resource
+    /// (`/v1/files`, `/v1/files/{id}`, ...); by default just [`route`](Endpoint::route).
+    fn routes(&self) -> Vec<(&'static str, &'static str)> {
+        vec![self.route()]
+    }
+
     /// The endpoint's rules, per-model ones included, after
     /// [`Provider::authorize`].
     fn validate(&self, provider: &P, req: &Request) -> Result<(), Rejection>;
@@ -344,8 +350,9 @@ async fn handle<P: Provider>(state: Arc<State<P>>, req: axum::extract::Request) 
     let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &()).await;
     let mut req = read(parts, body).await;
     let found = state.endpoints.iter().find_map(|e| {
-        let (method, pattern) = e.route();
-        let param = fits(pattern, &req.path).filter(|_| method == req.method)?;
+        let param = e.routes().into_iter().find_map(|(method, pattern)| {
+            fits(pattern, &req.path).filter(|_| method == req.method)
+        })?;
         Some((e, param))
     });
     req.param = found.as_ref().and_then(|(_, param)| param.clone());

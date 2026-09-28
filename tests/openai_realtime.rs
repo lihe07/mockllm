@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use mockllm::{Answer, FakeOpenAi};
 use serde_json::{Value, json};
@@ -80,12 +81,14 @@ async fn a_text_response_over_websocket() {
     let expected = [
         "response.created",
         "response.output_item.added",
+        "conversation.item.added",
         "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.done",
         "response.content_part.done",
         "response.output_item.done",
+        "conversation.item.done",
         "response.done",
     ];
     assert_eq!(types(&events), expected);
@@ -155,4 +158,137 @@ async fn errors_auth_and_breaks() {
         "response.created"
     );
     assert!(next(&mut ws).await.is_err());
+}
+
+#[tokio::test]
+async fn audio_answers_stream_base64_deltas() {
+    let openai = FakeOpenAi::start().await;
+    let pcm = vec![7u8; 6000];
+    openai.answer(Answer::audio(pcm.clone()));
+    let mut ws = connect(&openai, Some("sk-test")).await.unwrap();
+    next(&mut ws).await.unwrap();
+    send(&mut ws, json!({ "type": "response.create" })).await;
+    let events = response(&mut ws).await;
+    let deltas: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_audio.delta")
+        .collect();
+    assert_eq!(deltas.len(), 2);
+    let decoded: Vec<u8> = deltas
+        .iter()
+        .flat_map(|e| {
+            base64::engine::general_purpose::STANDARD
+                .decode(e["delta"].as_str().unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(decoded, pcm);
+    assert!(types(&events).contains(&"response.output_audio.done"));
+    let done = &events.last().unwrap()["response"];
+    assert_eq!(done["output"][0]["content"][0]["type"], "output_audio");
+    assert_eq!(done["usage"]["output_token_details"]["audio_tokens"], 2);
+
+    // Audio does not fit a text-only response.
+    openai.answer(Answer::audio(pcm));
+    let text = json!({ "type": "response.create", "response": { "output_modalities": ["text"] } });
+    send(&mut ws, text).await;
+    let e = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(
+        (&e["type"], &e["error"]["type"]),
+        (&json!("error"), &json!("server_error"))
+    );
+}
+
+#[tokio::test]
+async fn function_calls() {
+    let openai = FakeOpenAi::start().await;
+    openai.answer(Answer::tool_call("get_weather", json!({ "city": "Paris" })));
+    let mut ws = connect(&openai, Some("sk-test")).await.unwrap();
+    next(&mut ws).await.unwrap();
+    send(&mut ws, json!({ "type": "response.create" })).await;
+    let events = response(&mut ws).await;
+    let args: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.function_call_arguments.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(args, r#"{"city":"Paris"}"#);
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    assert_eq!(done["name"], "get_weather");
+    assert!(done["call_id"].is_string());
+    let item = &events.last().unwrap()["response"]["output"][0];
+    assert_eq!(item["type"], "function_call");
+    assert_eq!(
+        (&item["arguments"], &item["call_id"]),
+        (&json!(args), &done["call_id"])
+    );
+
+    // The client sends the result back as an item.
+    let output = json!({ "type": "conversation.item.create", "item": { "type": "function_call_output", "call_id": done["call_id"], "output": "sunny" } });
+    send(&mut ws, output).await;
+    let added = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(added["type"], "conversation.item.added");
+    assert_eq!(added["previous_item_id"], item["id"]);
+    assert_eq!(added["item"]["output"], "sunny");
+    assert!(added["item"]["id"].is_string());
+    let done = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(done["type"], "conversation.item.done");
+}
+
+#[tokio::test]
+async fn conversation_items_and_the_audio_buffer() {
+    let openai = FakeOpenAi::start().await;
+    let mut ws = connect(&openai, Some("sk-test")).await.unwrap();
+    next(&mut ws).await.unwrap();
+    let hi = json!({ "type": "conversation.item.create", "item": { "id": "msg_1", "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] } });
+    send(&mut ws, hi).await;
+    let added = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(added["item"]["id"], "msg_1");
+    assert_eq!(added["previous_item_id"], Value::Null);
+    next(&mut ws).await.unwrap();
+
+    // Committing an empty buffer is an error naming the client event.
+    send(
+        &mut ws,
+        json!({ "event_id": "c1", "type": "input_audio_buffer.commit" }),
+    )
+    .await;
+    let e = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(e["error"]["code"], "input_audio_buffer_commit_empty");
+    assert_eq!(e["error"]["event_id"], "c1");
+
+    // Appends get no reply; a commit makes a user audio item.
+    let audio = base64::engine::general_purpose::STANDARD.encode([0u8; 480]);
+    send(
+        &mut ws,
+        json!({ "type": "input_audio_buffer.append", "audio": audio }),
+    )
+    .await;
+    send(&mut ws, json!({ "type": "input_audio_buffer.commit" })).await;
+    let committed = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(committed["type"], "input_audio_buffer.committed");
+    assert_eq!(committed["previous_item_id"], "msg_1");
+    let added = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(added["item"]["id"], committed["item_id"]);
+    assert_eq!(added["item"]["content"][0]["type"], "input_audio");
+    next(&mut ws).await.unwrap();
+    send(&mut ws, json!({ "type": "input_audio_buffer.clear" })).await;
+    assert_eq!(
+        next(&mut ws).await.unwrap().unwrap()["type"],
+        "input_audio_buffer.cleared"
+    );
+
+    // Rules of the items, and unknown events.
+    let assistant_audio = json!({ "type": "conversation.item.create", "item": { "type": "message", "role": "assistant", "content": [{ "type": "output_audio", "audio": "AAAA" }] } });
+    send(&mut ws, assistant_audio).await;
+    assert_eq!(next(&mut ws).await.unwrap().unwrap()["type"], "error");
+    send(&mut ws, json!({ "type": "conversation.item.create" })).await;
+    let e = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(e["error"]["code"], "missing_required_parameter");
+    send(&mut ws, json!({ "type": "session.explode" })).await;
+    let e = next(&mut ws).await.unwrap().unwrap();
+    assert_eq!(e["error"]["code"], "invalid_value");
 }
