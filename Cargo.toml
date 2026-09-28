@@ -1,12 +1,12 @@
 [package]
 name = "mockllm"
-description = "Mock LLM providers over real HTTP: OpenAI Chat Completions and Anthropic Messages, with their request rules, per-model quirks and exact framing."
+description = "Mock LLM providers over real HTTP and WebSocket: OpenAI, Anthropic and Gemini endpoints, with their request rules, per-model quirks and exact framing."
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lihe07/mockllm"
-keywords = ["llm", "mock", "openai", "anthropic", "testing"]
+keywords = ["llm", "mock", "openai", "anthropic", "gemini"]
 categories = ["development-tools::testing"]
 
 [lints.rust]
@@ -20,12 +20,15 @@ todo = "warn"
 unwrap_used = "warn"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 bytes = "1"
 futures = "0.3"
+multer = "3"
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2", "multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = "0.28"

@@ -1,12 +1,13 @@
-//! A mock Anthropic Messages: `POST /v1/messages`.
+//! Anthropic Messages: `POST /v1/messages`.
+//! https://platform.claude.com/docs/en/api/messages/create
 
-use std::sync::Arc;
-
-use axum::response::Response;
 use serde_json::{Map, Value, json};
 
-use crate::anthropic_models::{Model, lookup};
-use crate::{Answer, Out, Reply, Request, Script, Server, next_id, pieces, send, tokens, words};
+use super::messages_models::{BASE, MODELS, Model};
+use super::{Anthropic, bad};
+use crate::core::misfit;
+use crate::util::{at, lookup, pieces, tokens, words};
+use crate::{Answer, Ctx, Endpoint, Out, Provider, Rejection, Reply, Request, event};
 
 /// Top-level fields the real API knows; any other is "Extra inputs are
 /// not permitted". https://platform.claude.com/docs/en/api/messages/create
@@ -18,75 +19,28 @@ const KNOWN: &[&str] = &[
     "top_p",
 ];
 
-/// A mock Anthropic Messages provider.
-#[derive(Debug)]
-pub struct FakeAnthropic {
-    server: Server,
-}
+pub(crate) struct Messages;
 
-impl FakeAnthropic {
-    pub async fn start() -> Self {
-        let server = Server::start(handle).await;
-        Self { server }
+impl Endpoint<Anthropic> for Messages {
+    fn route(&self) -> (&'static str, &'static str) {
+        ("POST", "/v1/messages")
     }
 
-    /// `http://127.0.0.1:<port>`, without the version, like
-    /// `https://api.anthropic.com`.
-    pub fn base_url(&self) -> String {
-        self.server.origin()
+    fn validate(&self, _: &Anthropic, req: &Request) -> Result<(), Rejection> {
+        validate(req).map(|_| ())
     }
 
-    /// Queues `answer` for the next valid request.
-    pub fn answer(&self, answer: Answer) {
-        self.server.answer(answer);
-    }
-
-    /// Every request received so far, valid or not.
-    pub fn requests(&self) -> Vec<Request> {
-        self.server.requests()
-    }
-}
-
-/// A request the real API would reject: status, error type, message.
-type Bad = (u16, &'static str, String);
-
-fn bad(message: impl Into<String>) -> Bad {
-    (400, "invalid_request_error", message.into())
-}
-
-/// The error shape, with `request_id`: https://platform.claude.com/docs/en/api/errors
-fn error_body(kind: &str, message: &str, id: u64) -> Value {
-    let error = json!({ "type": kind, "message": message });
-    json!({ "type": "error", "error": error, "request_id": format!("req_fake{id}") })
-}
-
-async fn handle(req: Request, script: Arc<Script>) -> Response {
-    let result = if req.method != "POST" || req.path != "/v1/messages" {
-        Err((404, "not_found_error", "Not Found".to_owned()))
-    } else {
-        validate(&req)
-    };
-    match result {
-        Ok((body, show)) => respond(body, show, script.next()).await,
-        Err((status, kind, message)) => {
-            let n = next_id();
-            let headers = [("request-id", format!("req_fake{n}"))];
-            let body = error_body(kind, &message, n);
-            send(&Answer::default(), &headers, Out::Json(status, body)).await
+    fn respond(&self, anthropic: &Anthropic, req: &Request, answer: &Answer, ctx: &Ctx) -> Out {
+        match validate(req) {
+            Ok((body, show)) => respond(anthropic, body, show, answer, ctx.id),
+            Err(r) => Out::Misfit(format!("mockllm: invalid request answered: {}", r.message)),
         }
     }
 }
 
 /// The body, and whether a thinking block shows its text (`None` when
 /// the model does not think on this request).
-fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Bad> {
-    if req.header("x-api-key").is_none() {
-        let message = "x-api-key header is required".to_owned();
-        return Err((401, "authentication_error", message));
-    }
-    if req.header("anthropic-version").is_none() {
-        return Err(bad("anthropic-version: header is required"));
-    }
+fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Rejection> {
     let Some(body) = req.body.as_object() else {
         return Err(bad("There was an error parsing the body of your request."));
     };
@@ -116,11 +70,11 @@ fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<bool>), Bad> {
     check_messages(messages)?;
     let model = body["model"].as_str().unwrap_or_default();
     let beta = req.header("anthropic-beta").unwrap_or_default();
-    let show = check_model(body, beta, model, &lookup(model))?;
+    let show = check_model(body, beta, model, &lookup(MODELS, BASE, model))?;
     Ok((body, show))
 }
 
-fn check_messages(messages: &[Value]) -> Result<(), Bad> {
+fn check_messages(messages: &[Value]) -> Result<(), Rejection> {
     let mut open: Vec<String> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or_default();
@@ -164,7 +118,7 @@ fn of(content: &Value, kind: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The rules of `model`'s row in [`crate::anthropic_models`], and the
+/// The rules of `model`'s row in `messages_models.rs`, and the
 /// thinking rules of every model. Wording marked (docs) is quoted from
 /// the docs; the rest is the wording commonly seen from the API.
 fn check_model(
@@ -172,7 +126,7 @@ fn check_model(
     beta: &str,
     id: &str,
     model: &Model,
-) -> Result<Option<bool>, Bad> {
+) -> Result<Option<bool>, Rejection> {
     let set = |p: &str| body.get(p).filter(|v| !v.is_null());
     let max_tokens = body["max_tokens"].as_u64().unwrap_or_default();
     if max_tokens > model.max_output {
@@ -202,7 +156,7 @@ fn check_model(
             _ => format!("\"thinking.type.{k}\" is not supported for this model."),
         }));
     }
-    let effort = crate::at(body, "output_config")["effort"]
+    let effort = at(body, "output_config")["effort"]
         .as_str()
         .unwrap_or_default();
     if kind == Some("between_tools") && matches!(effort, "xhigh" | "max") {
@@ -214,7 +168,7 @@ fn check_model(
     let on =
         matches!(kind, Some("enabled" | "adaptive")) || (kind.is_none() && model.thinks_by_default);
     let forced = matches!(
-        crate::at(body, "tool_choice")["type"].as_str(),
+        at(body, "tool_choice")["type"].as_str(),
         Some("any" | "tool")
     );
     if forced && model.no_forced_tools {
@@ -319,40 +273,6 @@ fn check_model(
     Ok(on.then_some(show))
 }
 
-fn event(name: &str, data: Value) -> String {
-    format!("event: {name}\ndata: {data}\n\n")
-}
-
-fn scripted_error(status: u16) -> (&'static str, &'static str) {
-    match status {
-        401 => ("authentication_error", "invalid x-api-key"),
-        402 => (
-            "billing_error",
-            "Your credit balance is too low to access the Anthropic API.",
-        ),
-        403 => (
-            "permission_error",
-            "Your API key does not have permission to use the specified resource.",
-        ),
-        404 => (
-            "not_found_error",
-            "The requested resource could not be found.",
-        ),
-        413 => (
-            "request_too_large",
-            "Request exceeds the maximum allowed number of bytes.",
-        ),
-        429 => (
-            "rate_limit_error",
-            "Number of request tokens has exceeded your per-minute rate limit.",
-        ),
-        504 => ("timeout_error", "Request timed out."),
-        529 => ("overloaded_error", "Overloaded"),
-        s if s >= 500 => ("api_error", "Internal server error"),
-        _ => ("invalid_request_error", "Invalid request"),
-    }
-}
-
 /// One content block: whole, opened empty for a stream, and its deltas.
 struct Block {
     whole: Value,
@@ -360,9 +280,19 @@ struct Block {
     deltas: Vec<Value>,
 }
 
-async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) -> Response {
-    let n = next_id();
-    let headers = [("request-id", format!("req_fake{n}"))];
+fn respond(
+    anthropic: &Anthropic,
+    body: &Map<String, Value>,
+    show: Option<bool>,
+    answer: &Answer,
+    n: u64,
+) -> Out {
+    let streaming = body.get("stream") == Some(&Value::Bool(true));
+    let overloaded = anthropic.scripted(529);
+    let kind = overloaded.kind.unwrap_or_default();
+    let error =
+        json!({ "type": "error", "error": { "type": kind, "message": overloaded.message } });
+    let error = event("error", &error);
     let mut blocks = Vec::new();
     let mut thought = 0;
     if let (Some(show), Some(reasoning)) = (show, &answer.reasoning) {
@@ -384,13 +314,12 @@ async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) 
             deltas,
         });
     }
-    let stop = match &answer.reply {
-        Reply::Error(status) => {
-            let (kind, message) = scripted_error(*status);
-            let body = error_body(kind, message, n);
-            return send(&answer, &headers, Out::Json(*status, body)).await;
+    let stop = match (&answer.reply, answer.reply.text()) {
+        (Reply::Events(events), _) if streaming => {
+            let named = |e: &Value| event(e["type"].as_str().unwrap_or_default(), e);
+            return Out::Sse(events.iter().map(named).collect(), error);
         }
-        Reply::Text(t) => {
+        (_, Some(t)) => {
             let deltas = words(t)
                 .into_iter()
                 .map(|p| json!({ "type": "text_delta", "text": p }));
@@ -401,7 +330,7 @@ async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) 
             });
             "end_turn"
         }
-        Reply::Tool { name, args } => {
+        (Reply::ToolCall { name, args }, _) => {
             let id = format!("toolu_fake{n}");
             // The real stream opens a tool's input with an empty delta.
             let parts = std::iter::once(String::new()).chain(pieces(&args.to_string(), 8));
@@ -414,6 +343,7 @@ async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) 
             });
             "tool_use"
         }
+        (other, _) => return misfit("messages", other),
     };
     let visible = blocks.last().map_or(0, |b| b.deltas.len() as u64);
     let (input, output) = (tokens(&body["messages"]), visible + thought);
@@ -437,8 +367,8 @@ async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) 
         "stop_sequence": null,
         "usage": usage,
     });
-    if body.get("stream") != Some(&Value::Bool(true)) {
-        return send(&answer, &headers, Out::Json(200, message)).await;
+    if !streaming {
+        return Out::Json(200, message);
     }
 
     message["content"] = json!([]);
@@ -447,34 +377,24 @@ async fn respond(body: &Map<String, Value>, show: Option<bool>, answer: Answer) 
     if let Some(u) = message["usage"].as_object_mut() {
         u.remove("output_tokens_details");
     }
-    let mut frames = vec![event(
-        "message_start",
-        json!({ "type": "message_start", "message": message }),
-    )];
+    let start = json!({ "type": "message_start", "message": message });
+    let mut frames = vec![event("message_start", &start)];
     for (i, b) in blocks.into_iter().enumerate() {
         let start = json!({ "type": "content_block_start", "index": i, "content_block": b.start });
-        frames.push(event("content_block_start", start));
+        frames.push(event("content_block_start", &start));
         if i == 0 {
-            frames.push(event("ping", json!({ "type": "ping" })));
+            frames.push(event("ping", &json!({ "type": "ping" })));
         }
         for d in b.deltas {
             let v = json!({ "type": "content_block_delta", "index": i, "delta": d });
-            frames.push(event("content_block_delta", v));
+            frames.push(event("content_block_delta", &v));
         }
-        frames.push(event(
-            "content_block_stop",
-            json!({ "type": "content_block_stop", "index": i }),
-        ));
+        let stop = json!({ "type": "content_block_stop", "index": i });
+        frames.push(event("content_block_stop", &stop));
     }
     let delta = json!({ "stop_reason": stop, "stop_sequence": null });
-    frames.extend([
-        event(
-            "message_delta",
-            json!({ "type": "message_delta", "delta": delta, "usage": end_usage }),
-        ),
-        event("message_stop", json!({ "type": "message_stop" })),
-    ]);
-    let (kind, message) = scripted_error(529);
-    let error = json!({ "type": "error", "error": { "type": kind, "message": message } });
-    send(&answer, &headers, Out::Sse(frames, event("error", error))).await
+    let end = json!({ "type": "message_delta", "delta": delta, "usage": end_usage });
+    frames.push(event("message_delta", &end));
+    frames.push(event("message_stop", &json!({ "type": "message_stop" })));
+    Out::Sse(frames, error)
 }

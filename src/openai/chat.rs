@@ -1,12 +1,13 @@
-//! A mock OpenAI Chat Completions: `POST /v1/chat/completions`.
+//! OpenAI Chat Completions: `POST /v1/chat/completions`.
+//! https://developers.openai.com/api/reference/resources/chat
 
-use std::sync::Arc;
-
-use axum::response::Response;
 use serde_json::{Map, Value, json};
 
-use crate::openai_models::{Allowed, Model, lookup};
-use crate::{Answer, Out, Reply, Request, Script, Server, next_id, pieces, send, tokens, words};
+use super::chat_models::{Allowed, BASE, MODELS, Model};
+use super::{OpenAi, Quirks, bad, object};
+use crate::core::misfit;
+use crate::util::{at, lookup, pieces, tokens, unix_now, words};
+use crate::{Answer, Ctx, Endpoint, Out, Provider, Rejection, Reply, Request, data};
 
 /// Top-level parameters the real API knows; any other is rejected.
 /// https://developers.openai.com/api/reference/resources/chat (Body Parameters)
@@ -31,148 +32,24 @@ const ROLES: &[&str] = &[
     "function",
 ];
 
-/// How an OpenAI-compatible provider deviates from OpenAI.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Quirks {
-    usage_every_chunk: bool,
-    no_done: bool,
-    reasoning_content: bool,
-}
+pub(crate) struct Chat;
 
-impl Quirks {
-    pub fn new() -> Self {
-        Self::default()
+impl Endpoint<OpenAi> for Chat {
+    fn route(&self) -> (&'static str, &'static str) {
+        ("POST", "/v1/chat/completions")
     }
 
-    /// Every stream chunk carries the running `usage`, asked or not, as
-    /// vLLM does with `continuous_usage_stats`:
-    /// https://docs.vllm.ai/en/v0.8.5/serving/openai_compatible_server.html
-    pub fn usage_every_chunk(mut self) -> Self {
-        self.usage_every_chunk = true;
-        self
+    fn validate(&self, _: &OpenAi, req: &Request) -> Result<(), Rejection> {
+        validate(req)
     }
 
-    /// The stream ends without `data: [DONE]`. Seen from OpenAI-compatible
-    /// servers in production; no public doc is cited for it.
-    pub fn no_done(mut self) -> Self {
-        self.no_done = true;
-        self
-    }
-
-    /// [`Answer::reasoning`] comes as `reasoning_content`, "the reasoning
-    /// contents of the assistant message, before the final answer", in
-    /// stream deltas and in the whole message, and is counted in
-    /// `reasoning_tokens`: https://api-docs.deepseek.com/api/create-chat-completion
-    pub fn reasoning_content(mut self) -> Self {
-        self.reasoning_content = true;
-        self
+    fn respond(&self, openai: &OpenAi, req: &Request, answer: &Answer, ctx: &Ctx) -> Out {
+        respond(openai, req, answer, ctx.id)
     }
 }
 
-/// A fake OpenAI Chat Completions provider.
-#[derive(Debug)]
-pub struct FakeOpenAi {
-    server: Server,
-}
-
-impl FakeOpenAi {
-    /// Starts OpenAI itself.
-    pub async fn start() -> Self {
-        Self::with_quirks(Quirks::default()).await
-    }
-
-    /// Starts an OpenAI-compatible provider with `quirks`.
-    pub async fn with_quirks(quirks: Quirks) -> Self {
-        let server = Server::start(move |req, script| handle(req, script, quirks)).await;
-        Self { server }
-    }
-
-    /// `http://127.0.0.1:<port>/v1`
-    pub fn base_url(&self) -> String {
-        format!("{}/v1", self.server.origin())
-    }
-
-    /// Queues `answer` for the next valid request.
-    pub fn answer(&self, answer: Answer) {
-        self.server.answer(answer);
-    }
-
-    /// Every request received so far, valid or not.
-    pub fn requests(&self) -> Vec<Request> {
-        self.server.requests()
-    }
-}
-
-/// A request the real API would reject.
-struct Bad {
-    status: u16,
-    message: String,
-    param: Option<String>,
-    code: Option<&'static str>,
-}
-
-fn bad(message: impl Into<String>, param: Option<&str>, code: Option<&'static str>) -> Bad {
-    let (message, param) = (message.into(), param.map(str::to_owned));
-    Bad {
-        status: 400,
-        message,
-        param,
-        code,
-    }
-}
-
-fn error_body(status: u16, message: &str, param: Option<&str>, code: Option<&str>) -> Value {
-    let kind = match status {
-        429 => "requests",
-        s if s >= 500 => "server_error",
-        _ => "invalid_request_error",
-    };
-    json!({ "error": { "message": message, "type": kind, "param": param, "code": code } })
-}
-
-async fn handle(req: Request, script: Arc<Script>, quirks: Quirks) -> Response {
-    let answer = Answer::default();
-    if req.method != "POST" || req.path != "/v1/chat/completions" {
-        let message = format!("Invalid URL ({} {})", req.method, req.path);
-        return send(
-            &answer,
-            &[],
-            Out::Json(404, error_body(404, &message, None, None)),
-        )
-        .await;
-    }
-    let body = match validate(&req) {
-        Ok(body) => body,
-        Err(b) => {
-            let v = error_body(b.status, &b.message, b.param.as_deref(), b.code);
-            return send(&answer, &[], Out::Json(b.status, v)).await;
-        }
-    };
-    respond(body, script.next(), quirks).await
-}
-
-fn validate(req: &Request) -> Result<&Map<String, Value>, Bad> {
-    if !req
-        .header("authorization")
-        .is_some_and(|v| v.starts_with("Bearer "))
-    {
-        let message = "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY).";
-        return Err(Bad {
-            status: 401,
-            ..bad(message, None, None)
-        });
-    }
-    let Some(body) = req.body.as_object() else {
-        return Err(bad(
-            "We could not parse the JSON body of your request.",
-            None,
-            None,
-        ));
-    };
-    if let Some(k) = body.keys().find(|k| !KNOWN.contains(&k.as_str())) {
-        let message = format!("Unrecognized request argument supplied: {k}");
-        return Err(bad(message, None, Some("unrecognized_request_argument")));
-    }
+fn validate(req: &Request) -> Result<(), Rejection> {
+    let body = object(req, KNOWN)?;
     let Some(model) = body.get("model").and_then(Value::as_str) else {
         return Err(bad("you must provide a model parameter", None, None));
     };
@@ -201,12 +78,11 @@ fn validate(req: &Request) -> Result<&Map<String, Value>, Bad> {
         let message = "The 'stream_options' parameter is only allowed when 'stream' is enabled.";
         return Err(bad(message, Some("stream_options"), None));
     }
-    check_model(body, &lookup(model))?;
-    Ok(body)
+    check_model(body, &lookup(MODELS, BASE, model))
 }
 
-/// The rules of `model`'s row in [`crate::openai_models`].
-fn check_model(body: &Map<String, Value>, model: &Model) -> Result<(), Bad> {
+/// The rules of `model`'s row in `chat_models.rs`.
+fn check_model(body: &Map<String, Value>, model: &Model) -> Result<(), Rejection> {
     let set = |p: &str| body.get(p).filter(|v| !v.is_null());
     if model.no_max_tokens && set("max_tokens").is_some() {
         let message = "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.";
@@ -266,7 +142,7 @@ fn check_model(body: &Map<String, Value>, model: &Model) -> Result<(), Bad> {
 }
 
 /// Roles, and tool messages answering exactly the preceding tool calls.
-fn check_messages(messages: &[Value]) -> Result<(), Bad> {
+fn check_messages(messages: &[Value]) -> Result<(), Rejection> {
     let mut open: Vec<String> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let role = m["role"].as_str().unwrap_or_default();
@@ -323,42 +199,21 @@ fn usage(prompt: u64, completion: u64, reasoning: u64) -> Value {
     })
 }
 
-fn scripted_error(status: u16) -> Value {
-    let (message, code) = match status {
-        401 => ("Incorrect API key provided.", Some("invalid_api_key")),
-        404 => (
-            "The model does not exist or you do not have access to it.",
-            Some("model_not_found"),
-        ),
-        429 => (
-            "Rate limit reached for requests.",
-            Some("rate_limit_exceeded"),
-        ),
-        503 => (
-            "The engine is currently overloaded, please try again later.",
-            None,
-        ),
-        s if s >= 500 => (
-            "The server had an error while processing your request. Sorry about that!",
-            None,
-        ),
-        _ => ("Invalid request.", None),
+fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
+    let (Some(body), quirks) = (req.object(), openai.quirks) else {
+        return Out::Misfit("mockllm: validated body is not an object".into());
     };
-    error_body(status, message, None, code)
-}
-
-async fn respond(body: &Map<String, Value>, answer: Answer, quirks: Quirks) -> Response {
-    let n = next_id();
-    let headers = [("x-request-id", format!("req_fake{n}"))];
-    let (text, tool) = match &answer.reply {
-        Reply::Error(status) => {
-            let v = scripted_error(*status);
-            return send(&answer, &headers, Out::Json(*status, v)).await;
+    let streaming = body.get("stream") == Some(&Value::Bool(true));
+    let error = data(&openai.error(&openai.scripted(500), n));
+    let (text, tool) = match (&answer.reply, answer.reply.text()) {
+        (_, Some(t)) => (words(t), None),
+        (Reply::ToolCall { name, args }, _) => (Vec::new(), Some((name, args.to_string()))),
+        (Reply::Events(events), _) if streaming => {
+            return Out::Sse(events.iter().map(data).collect(), error);
         }
-        Reply::Text(t) => (words(t), None),
-        Reply::Tool { name, args } => (Vec::new(), Some((name, args.to_string()))),
+        (other, _) => return misfit("chat completions", other),
     };
-    let model = lookup(body["model"].as_str().unwrap_or_default());
+    let model = lookup(MODELS, BASE, body["model"].as_str().unwrap_or_default());
     // Reasoning is counted by reasoning models, and shown only by providers
     // with the `reasoning_content` quirk.
     let thought = answer.reasoning.as_deref().map(words).unwrap_or_default();
@@ -382,10 +237,10 @@ async fn respond(body: &Map<String, Value>, answer: Answer, quirks: Quirks) -> R
     let mut head = Map::new();
     head.insert("id".into(), format!("chatcmpl-fake{n}").into());
     head.insert("object".into(), "chat.completion".into());
-    head.insert("created".into(), crate::unix_now().into());
+    head.insert("created".into(), unix_now().into());
     head.insert("model".into(), body["model"].clone());
 
-    if body.get("stream") != Some(&Value::Bool(true)) {
+    if !streaming {
         let content = tool.is_none().then(|| text.concat());
         let mut message =
             json!({ "role": "assistant", "content": content, "refusal": null, "annotations": [] });
@@ -403,7 +258,7 @@ async fn respond(body: &Map<String, Value>, answer: Answer, quirks: Quirks) -> R
         head.insert("usage".into(), total);
         head.insert("service_tier".into(), "default".into());
         head.insert("system_fingerprint".into(), "fp_fake".into());
-        return send(&answer, &headers, Out::Json(200, head.into())).await;
+        return Out::Json(200, head.into());
     }
 
     // The deltas of one choice, in order; the last, empty, has the finish.
@@ -431,14 +286,13 @@ async fn respond(body: &Map<String, Value>, answer: Answer, quirks: Quirks) -> R
     head.insert("object".into(), "chat.completion.chunk".into());
     head.insert("service_tier".into(), "default".into());
     head.insert("system_fingerprint".into(), "fp_fake".into());
-    let options = crate::at(body, "stream_options");
+    let options = at(body, "stream_options");
     let include_usage = options["include_usage"] == true;
     // "included by default and omitted when
     // `stream_options.include_obfuscation` is `false`":
     // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
     // OpenAI-compatible providers (any quirk) do not obfuscate.
     let obfuscate = options["include_obfuscation"] != false && quirks == Quirks::default();
-    let frame = |v: Value| format!("data: {v}\n\n");
     let mut frames = Vec::new();
     for (step, delta) in deltas.iter().enumerate() {
         for i in 0..choices {
@@ -460,21 +314,16 @@ async fn respond(body: &Map<String, Value>, answer: Answer, quirks: Quirks) -> R
             if obfuscate {
                 chunk.insert("obfuscation".into(), "x".repeat(step % 7 + 1).into());
             }
-            frames.push(frame(chunk.into()));
+            frames.push(data(&chunk.into()));
         }
     }
     if include_usage {
         head.insert("choices".into(), json!([]));
         head.insert("usage".into(), total);
-        frames.push(frame(head.into()));
+        frames.push(data(&head.into()));
     }
     if !quirks.no_done {
         frames.push("data: [DONE]\n\n".into());
     }
-    send(
-        &answer,
-        &headers,
-        Out::Sse(frames, frame(scripted_error(500))),
-    )
-    .await
+    Out::Sse(frames, error)
 }

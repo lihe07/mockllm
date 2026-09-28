@@ -111,8 +111,8 @@ pub(crate) const MODELS: &[Model] = &[
     Model { prefix: "claude-sonnet-4", ..EARLIER },
 ];
 
-/// The row for `model`: the longest matching prefix, else [`BASE`].
-pub(crate) fn lookup(model: &str) -> Model {
-    let rows = MODELS.iter().filter(|m| model.starts_with(m.prefix));
-    rows.max_by_key(|m| m.prefix.len()).copied().unwrap_or(BASE)
+impl crate::util::Row for Model {
+    fn prefix(&self) -> &'static str {
+        self.prefix
+    }
 }
