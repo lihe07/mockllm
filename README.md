@@ -74,6 +74,7 @@ src/
     embeddings.rs   POST /v1/embeddings          (table inline)
     images.rs       POST /v1/images/generations  (table inline)
     realtime.rs     GET  /v1/realtime, WebSocket
+    responses.rs    POST /v1/responses           (rules from chat_models.rs)
   anthropic/
     mod.rs          Anthropic: x-api-key, anthropic-version, error shape
     messages.rs     POST /v1/messages            (+ messages_models.rs)
@@ -128,6 +129,31 @@ status, `retry-after`.
   with `finish_reason`, `include_usage` (usage `null` on every chunk, then
   a `choices: []` usage chunk), `obfuscation` unless
   `include_obfuscation: false`, `data: [DONE]`, `x-request-id`.
+- **OpenAI Responses** (`openai/responses.rs`,
+  [reference](https://developers.openai.com/api/reference/resources/responses/methods/create),
+  [streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events)):
+  `model` required unless a `prompt` template is given, not both
+  `previous_response_id` and `conversation`, `stream_options` only with
+  `stream`, `temperature` 0..=2, `top_logprobs` 0..=20, `include` values,
+  `input` a string or items, message roles, `function_call` and
+  `function_call_output` items paired by `call_id` (an output may answer a
+  stored call with `previous_response_id` or `conversation`), function
+  tools with a top-level `name`; per-model rules from the Chat Completions
+  table (`max_output_tokens`, `reasoning.effort` values, sampling and
+  `message.output_text.logprobs` only where the model allows, per the
+  [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model)).
+  The Response object echoing the request's settings with their defaults;
+  `message` items with `output_text`, `function_call` items (`fc_` id,
+  `call_id`), a `reasoning` item first on reasoning models (`summary` only
+  with `reasoning.summary`, `encrypted_content`), usage with
+  `reasoning_tokens`. Streaming as named events (`event: <type>`) with
+  `sequence_number` from 0: `response.created`, `response.in_progress`,
+  `output_item.added`/`.done`, `content_part.*`, `output_text.delta`/`.done`,
+  `function_call_arguments.delta`/`.done`,
+  `reasoning_summary_part.*`/`reasoning_summary_text.*`,
+  `response.completed`; `obfuscation` on deltas unless
+  `include_obfuscation: false`; no `[DONE]`; a mid-stream `error` event
+  (`code`, `message`, `param`, `sequence_number`).
 - **OpenAI Embeddings** (`openai/embeddings.rs`): `input` required, not
   empty, at most 2048 items; vector length per model, `dimensions` (not on
   `ada-002`), `encoding_format` float or base64 (little-endian f32), usage.
@@ -246,7 +272,6 @@ they need already exist.
 
 | Endpoint | File | Needs | Docs |
 |---|---|---|---|
-| OpenAI Responses, `POST /v1/responses` | `openai/responses.rs` | JSON, named SSE | [reference](https://developers.openai.com/api/reference/resources/responses/methods/create), [streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events) |
 | OpenAI speech, `POST /v1/audio/speech` | `openai/speech.rs` | `Answer::audio`, `Out::Bytes` / `Out::Chunks` | [reference](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create) |
 | OpenAI transcriptions, `POST /v1/audio/transcriptions` | `openai/transcriptions.rs` | multipart, `Answer::transcript`, SSE | [reference](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create) |
 | OpenAI image edits, `POST /v1/images/edits` | `openai/image_edits.rs` | multipart, `Answer::image` | [reference](https://developers.openai.com/api/reference/resources/images/methods/edit) |
