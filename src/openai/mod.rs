@@ -2,9 +2,11 @@
 //! `x-request-id`, the quirks of OpenAI-compatible providers), and the
 //! endpoints, one file each.
 
+mod batches;
 mod chat;
 mod chat_models;
 mod embeddings;
+mod files;
 mod image_edits;
 mod images;
 mod realtime;
@@ -36,6 +38,8 @@ impl Provider for OpenAi {
     const BASE_PATH: &'static str = "/v1";
 
     fn endpoints() -> Vec<Box<dyn Endpoint<Self>>> {
+        // The mock's files, shared by the files and batches endpoints.
+        let files = files::Store::default();
         vec![
             Box::new(chat::Chat),
             Box::new(embeddings::Embeddings),
@@ -45,6 +49,8 @@ impl Provider for OpenAi {
             Box::new(speech::Speech),
             Box::new(transcriptions::Transcriptions),
             Box::new(image_edits::ImageEdits),
+            Box::new(files::Files(files.clone())),
+            Box::new(batches::Batches::new(files)),
         ]
     }
 
