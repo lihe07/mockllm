@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -42,6 +42,23 @@ pub fn data(v: &Value) -> String {
 /// A named SSE event.
 pub fn event(name: &str, v: &Value) -> String {
     format!("event: {name}\ndata: {v}\n\n")
+}
+
+/// A raw event framed by `frame`, except a JSON string: the whole SSE
+/// event as it is, ended by a blank line.
+pub(crate) fn framed(e: &Value, frame: impl Fn(&Value) -> String) -> String {
+    match e {
+        Value::String(s) => format!("{}\n\n", s.trim_end_matches('\n')),
+        _ => frame(e),
+    }
+}
+
+/// A WebSocket message's text: a JSON string as it is, else the JSON.
+fn text(e: &Value) -> String {
+    match e {
+        Value::String(s) => s.clone(),
+        _ => e.to_string(),
+    }
 }
 
 /// `frames` after `error_after` and `cut_after`.
@@ -99,9 +116,11 @@ pub(crate) async fn send(
     let h = response.headers_mut();
     let retry = answer.retry_after.map(|s| ("retry-after", s.to_string()));
     let all = [("content-type", kind)].into_iter();
-    for (name, value) in all.chain(headers.iter().cloned()).chain(retry) {
-        if let Ok(value) = value.parse() {
-            h.insert(name, value);
+    let own = answer.headers.iter().map(|(n, v)| (n.as_str(), v.clone()));
+    let all = all.chain(headers.iter().cloned()).chain(retry).chain(own);
+    for (name, value) in all {
+        if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), value.parse()) {
+            h.insert::<HeaderName>(name, value);
         }
     }
     response
@@ -117,7 +136,7 @@ pub(crate) async fn socket(
     ctx: Ctx,
 ) {
     for e in session.open(&ctx) {
-        if ws.send(Message::Text(e.to_string().into())).await.is_err() {
+        if ws.send(Message::Text(text(&e).into())).await.is_err() {
             return;
         }
     }
@@ -163,7 +182,7 @@ async fn play(ws: &mut WebSocket, turn: Turn) -> bool {
         if i > 0 {
             tokio::time::sleep(answer.pace).await;
         }
-        if ws.send(Message::Text(e.to_string().into())).await.is_err() {
+        if ws.send(Message::Text(text(&e).into())).await.is_err() {
             return false;
         }
     }

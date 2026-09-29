@@ -7,6 +7,7 @@
 //! wording the docs do not give is the wording commonly seen from the API,
 //! marked "(commonly seen)". "CREATE" in comments is the first URL above.
 
+use crate::transport::framed;
 use serde_json::{Map, Value, json};
 
 use super::chat_models::{Allowed, BASE, MODELS, Model};
@@ -289,7 +290,7 @@ fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
     let error = event("error", &error);
     if let (Reply::Events(events), true) = (&answer.reply, streaming) {
         let named = |e: &Value| event(e["type"].as_str().unwrap_or_default(), e);
-        return Out::Sse(events.iter().map(named).collect(), error);
+        return Out::Sse(events.iter().map(|e| framed(e, named)).collect(), error);
     }
     let model = lookup(MODELS, BASE, at(body, "model").as_str().unwrap_or_default());
     // Delta events carry `obfuscation` "by default", unless

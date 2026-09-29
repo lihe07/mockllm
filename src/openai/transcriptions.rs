@@ -4,6 +4,7 @@
 //! https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/streaming-events
 //! Guide: https://developers.openai.com/api/docs/guides/speech-to-text
 
+use crate::transport::framed;
 use serde_json::{Map, Value, json};
 
 use super::{OpenAi, bad, object};
@@ -214,7 +215,7 @@ impl Endpoint<OpenAi> for Transcriptions {
             Reply::Transcript(t) | Reply::Text(t) => t.as_str(),
             Reply::Unscripted => crate::answer::UNSCRIPTED,
             Reply::Events(events) if stream => {
-                return Out::Sse(events.iter().map(data).collect(), error);
+                return Out::Sse(events.iter().map(|e| framed(e, data)).collect(), error);
             }
             other => return misfit("transcriptions", other),
         };

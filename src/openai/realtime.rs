@@ -272,7 +272,7 @@ impl Live {
     fn respond(&mut self, client: &Value, answer: Answer) -> Turn {
         let events = match (answer.status, &answer.reply) {
             (Some(status), _) => {
-                let r = self.openai.scripted(status);
+                let r = crate::core::scripted(&self.openai, &answer, status);
                 let server = status >= 500;
                 let kind = if server {
                     "server_error"

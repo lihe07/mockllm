@@ -391,11 +391,23 @@ async fn handle<P: Provider>(state: Arc<State<P>>, req: axum::extract::Request) 
         return upgrade.on_upgrade(move |ws| transport::socket(ws, session, script, path, ctx));
     }
     let answer = state.script.next();
-    let out = match answer.status {
-        Some(status) => Out::Json(status, p.error(&p.scripted(status), id)),
-        None => endpoint.respond(p, &req, &answer, &ctx),
+    let out = match (answer.status, &answer.reply) {
+        (Some(status), _) => Out::Json(status, p.error(&scripted(p, &answer, status), id)),
+        (None, Reply::Body(v)) => Out::Json(200, v.clone()),
+        (None, Reply::Raw(b)) => Out::Bytes("application/json".into(), b.clone()),
+        (None, _) => endpoint.respond(p, &req, &answer, &ctx),
     };
     transport::send(&answer, &headers, out).await
+}
+
+/// The rejection an [`Answer::error`] of `status` sends, with the
+/// answer's own message if it has one.
+pub(crate) fn scripted<P: Provider>(p: &P, answer: &Answer, status: u16) -> Rejection {
+    let mut r = p.scripted(status);
+    if let Some(m) = &answer.message {
+        r.message.clone_from(m);
+    }
+    r
 }
 
 /// Reads a whole request; a `multipart/form-data` body is split into its

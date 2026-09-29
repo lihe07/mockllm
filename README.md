@@ -27,7 +27,17 @@ openai.answer(Answer::image(png_bytes));             // /v1/images/generations, 
 openai.answer(Answer::audio(mp3_bytes));             // /v1/audio/speech
 openai.answer(Answer::transcript("Hello"));          // /v1/audio/transcriptions
 openai.answer(Answer::events(vec![json!({ "type": "custom" })])); // raw SSE or WebSocket events
+openai.answer(Answer::events(vec![json!({ "x": 1 }), json!("data: [DONE]")])); // a string: sent verbatim
 openai.answer(Answer::error(429).retry_after(7));    // provider's error shape
+openai.answer(Answer::error(429).message("Slow down")); // same shape, own message
+
+// A whole response body, exactly as given (status 200, no fresh id or
+// `created`), to any HTTP request, for byte-for-byte client tests.
+openai.answer(Answer::body(json!({ "id": "chatcmpl-1", "created": 1 })));
+openai.answer(Answer::raw(r#"{"id":"chatcmpl-1"}"#));  // bytes, application/json
+
+// Response headers per answer, set after (and over) all others.
+openai.answer(Answer::text("Hi").header("x-ratelimit-remaining-requests", "0"));
 
 // Timing and breaks, on SSE, chunked bodies and WebSocket alike.
 openai.answer(Answer::text("Hi there").cut_after(2));   // connection drops after 2 events
@@ -51,7 +61,11 @@ let compat = FakeOpenAi::with_quirks(Quirks::new().no_done().reasoning_content()
 
 A request that fails validation does not use up a queued answer. An
 answer the endpoint cannot frame (an image to chat completions) is a `500`
-whose body says so. The server stops when the mock is dropped.
+whose body says so. A string in `Answer::events` is one whole SSE event as
+written, ended by a blank line (on a WebSocket, the message text as
+written). `Answer::body` and `Answer::raw` are sent by the core without
+the endpoint, so they fit any HTTP endpoint but not a WebSocket session;
+`.header` applies to HTTP responses. The server stops when the mock is dropped.
 
 ## Design
 
@@ -139,7 +153,9 @@ pub enum Out {
 
 A request is recorded, routed, checked by `authorize` then `validate`,
 and only then takes an answer. An `Answer::error` is sent by the core in
-the provider's shape; any other answer goes to `respond`, or, on a
+the provider's shape (its `message` replacing the `scripted` wording), and
+an `Answer::body` or `Answer::raw` as it is; any other answer goes to
+`respond`, or, on a
 WebSocket, to the `Session` when a client event asks for a response.
 
 ## What is modelled
@@ -272,7 +288,8 @@ status, `retry-after`.
   Sources: [batches reference](https://developers.openai.com/api/reference/resources/batches),
   [Batch guide](https://developers.openai.com/api/docs/guides/batch).
 - **Anthropic Messages** (`anthropic/messages.rs`): `anthropic-version`
-  and `max_tokens` required, no `system` role, temperature in 0..=1,
+  and `max_tokens` required, at least one message (wording commonly
+  seen), no `system` role, temperature in 0..=1,
   non-empty content, tool-use/result pairing, named SSE events with
   `ping`, `input_json_delta` (opening with an empty one), `thinking` blocks
   with `signature_delta`, `event: error` mid-stream, `request_id` in error
@@ -435,7 +452,8 @@ one commonly seen from the API.
   `Endpoint<Provider>`: `route`, `validate` (its rules and per-model
   table, with the source URL on every rule), and `respond` returning an
   `Out` (or `session` for a WebSocket). Match on `answer.reply()` for the
-  kinds it frames and return `misfit(..)` for the rest. Then one line in
+  kinds it frames and return `misfit(..)` for the rest; frame raw SSE
+  events with `transport::framed`, so a string goes out verbatim. Then one line in
   the provider's `endpoints()` in `mod.rs`, and
   `tests/<provider>_<endpoint>.rs`. Nothing else changes: auth, errors,
   recording, the queue and timing are already there. A resource with

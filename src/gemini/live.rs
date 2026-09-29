@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use super::Gemini;
 use crate::util::{next_id, tokens, words};
-use crate::{Answer, Endpoint, Provider, Rejection, Reply, Request, Session, Turn};
+use crate::{Answer, Endpoint, Rejection, Reply, Request, Session, Turn};
 
 const PATH: &str = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -136,7 +136,7 @@ impl Bidi {
     fn respond(&mut self, answer: Answer) -> Turn {
         if let Some(status) = answer.status {
             let code = if status >= 500 { 1011 } else { 1008 };
-            let reason = self.gemini.scripted(status).message;
+            let reason = crate::core::scripted(&self.gemini, &answer, status).message;
             let turn = self.closing(code, &reason);
             return Turn {
                 answer: Some(answer),

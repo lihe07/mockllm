@@ -5,6 +5,7 @@
 //! https://github.com/openai/openai-openapi (`createSpeech`,
 //! `SpeechAudioDeltaEvent`, `SpeechAudioDoneEvent`).
 
+use crate::transport::framed;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -184,7 +185,7 @@ impl Endpoint<OpenAi> for Speech {
             Reply::Audio(bytes) => bytes.clone(),
             Reply::Unscripted => silence(format),
             Reply::Events(events) if sse => {
-                return Out::Sse(events.iter().map(data).collect(), error);
+                return Out::Sse(events.iter().map(|e| framed(e, data)).collect(), error);
             }
             other => return misfit("speech", other),
         };

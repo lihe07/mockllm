@@ -1,6 +1,7 @@
 //! OpenAI Images, generations: `POST /v1/images/generations`.
 //! https://developers.openai.com/api/reference/resources/images/methods/generate
 
+use crate::transport::framed;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -193,7 +194,7 @@ pub(super) fn frame(openai: &OpenAi, kind: &Kind, body: &Value, answer: &Answer,
         Reply::Unscripted => Bytes::from(STANDARD.decode(PNG).unwrap_or_default()),
         Reply::Events(events) if streaming(body) => {
             let named = |e: &Value| event(e["type"].as_str().unwrap_or("message"), e);
-            return Out::Sse(events.iter().map(named).collect(), error);
+            return Out::Sse(events.iter().map(|e| framed(e, named)).collect(), error);
         }
         other => return misfit(kind.name, other),
     };

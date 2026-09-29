@@ -26,6 +26,8 @@ pub struct Answer {
     pub(crate) delay_first: Duration,
     pub(crate) pace: Duration,
     pub(crate) retry_after: Option<u64>,
+    pub(crate) message: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 /// What an [`Answer`] says. Each endpoint frames the kinds it can.
@@ -46,8 +48,15 @@ pub enum Reply {
     Audio(Bytes),
     Transcript(String),
     /// Raw events, sent as they are: SSE `data:` (or named by `type`) or
-    /// WebSocket messages.
+    /// WebSocket messages. A JSON string is sent verbatim: over SSE as the
+    /// whole event (`"data: [DONE]"`), ended by a blank line; over a
+    /// WebSocket as the message text.
     Events(Vec<Value>),
+    /// A whole JSON body, sent as it is with status 200 to any HTTP request.
+    Body(Value),
+    /// A whole body of bytes, sent as they are with status 200 and
+    /// `content-type: application/json` to any HTTP request.
+    Raw(Bytes),
 }
 
 impl Reply {
@@ -72,6 +81,8 @@ impl Reply {
             Reply::Audio(_) => "audio",
             Reply::Transcript(_) => "a transcript",
             Reply::Events(_) => "raw events",
+            Reply::Body(_) => "a whole body",
+            Reply::Raw(_) => "raw bytes",
         }
     }
 }
@@ -93,6 +104,8 @@ impl Answer {
             delay_first: Duration::ZERO,
             pace: Duration::ZERO,
             retry_after: None,
+            message: None,
+            headers: Vec::new(),
         }
     }
 
@@ -130,8 +143,22 @@ impl Answer {
     }
 
     /// Raw events sent as they are, for what the endpoint does not model.
+    /// A JSON string is sent verbatim, such as `"data: [DONE]"`.
     pub fn events(events: Vec<Value>) -> Self {
         Self::of(Reply::Events(events))
+    }
+
+    /// `json` as the whole response body, exactly: status 200, nothing
+    /// generated (no fresh id or `created`), whatever the request asks,
+    /// streamed or not. For comparing a client's output byte for byte.
+    pub fn body(json: Value) -> Self {
+        Self::of(Reply::Body(json))
+    }
+
+    /// `bytes` as the whole response body, exactly, as [`Answer::body`];
+    /// `content-type: application/json` unless set by [`Answer::header`].
+    pub fn raw(bytes: impl Into<Bytes>) -> Self {
+        Self::of(Reply::Raw(bytes.into()))
     }
 
     /// An error of `status` in the provider's own shape, before any body.
@@ -186,6 +213,20 @@ impl Answer {
         self
     }
 
+    /// The message of an [`Answer::error`], in place of the provider's
+    /// usual wording; the error shape stays the provider's.
+    pub fn message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Adds (or replaces) response header `name` on this answer's HTTP
+    /// response, after every other header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
     pub fn reply(&self) -> &Reply {
         &self.reply
     }
@@ -197,5 +238,10 @@ impl Answer {
     /// The status of an [`Answer::error`].
     pub fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// The message set by [`Answer::message`].
+    pub fn error_message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 }

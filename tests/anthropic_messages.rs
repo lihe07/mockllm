@@ -693,3 +693,24 @@ async fn requests_records_what_was_sent() {
     assert_eq!(seen[0].header("anthropic-version"), Some("2023-06-01"));
     assert_eq!(seen[0].body, hi("claude-x"));
 }
+
+#[tokio::test]
+async fn empty_messages_are_rejected() {
+    let anthropic = FakeAnthropic::start().await;
+    let r = messages(
+        &anthropic,
+        with(hi("claude-sonnet-4-5"), json!({ "messages": [] })),
+    )
+    .await;
+    rejected(&r, "messages: at least one message is required");
+}
+
+#[tokio::test]
+async fn scripted_error_keeps_the_shape_with_its_own_message() {
+    let anthropic = FakeAnthropic::start().await;
+    anthropic.answer(Answer::error(429).message("slow down"));
+    let r = messages(&anthropic, hi("claude-sonnet-4-5")).await;
+    assert_eq!(r.status, 429);
+    assert_eq!(r.json()["type"], "error");
+    assert_eq!(r.error(), ("rate_limit_error".into(), "slow down".into()));
+}

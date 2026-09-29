@@ -9,6 +9,7 @@
 //! "status"}}`); the OpenAPI spec gives `{"error": {"code", "message"}}`
 //! with a string `code`, which is not confirmed for HTTP errors.
 
+use crate::transport::framed;
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
@@ -100,7 +101,7 @@ impl Endpoint<Gemini> for Interactions {
         let frame = |v: &Value| event(v["event_type"].as_str().unwrap_or("message"), v);
         if let (Reply::Events(events), true) = (&answer.reply, stream) {
             return Out::Sse(
-                events.iter().map(frame).collect(),
+                events.iter().map(|e| framed(e, frame)).collect(),
                 format!("event: error\ndata: {ERROR}\n\n"),
             );
         }

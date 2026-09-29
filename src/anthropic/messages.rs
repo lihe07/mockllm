@@ -1,6 +1,7 @@
 //! Anthropic Messages: `POST /v1/messages`.
 //! https://platform.claude.com/docs/en/api/messages/create
 
+use crate::transport::framed;
 use serde_json::{Map, Value, json};
 
 use super::messages_models::{BASE, MODELS, Model};
@@ -65,6 +66,11 @@ pub(crate) fn validate(req: &Request) -> Result<(&Map<String, Value>, Option<boo
     let Some(messages) = body["messages"].as_array() else {
         return Err(bad("messages: Input should be a valid list"));
     };
+    if messages.is_empty() {
+        // The real API requires at least one message; the wording is the
+        // one commonly seen from the API.
+        return Err(bad("messages: at least one message is required"));
+    }
     // Consecutive same-role turns are combined, not rejected (see the
     // `messages` parameter in the reference above).
     check_messages(messages)?;
@@ -317,7 +323,7 @@ pub(crate) fn respond(
     let stop = match (&answer.reply, answer.reply.text()) {
         (Reply::Events(events), _) if streaming => {
             let named = |e: &Value| event(e["type"].as_str().unwrap_or_default(), e);
-            return Out::Sse(events.iter().map(named).collect(), error);
+            return Out::Sse(events.iter().map(|e| framed(e, named)).collect(), error);
         }
         (_, Some(t)) => {
             let deltas = words(t)

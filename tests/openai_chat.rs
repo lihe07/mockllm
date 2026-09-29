@@ -624,3 +624,69 @@ async fn quirk_reasoning_content() {
         .unwrap();
     assert!(last_thought < first_text);
 }
+
+#[tokio::test]
+async fn body_is_the_whole_response_exactly() {
+    let openai = FakeOpenAi::start().await;
+    let body = json!({ "id": "chatcmpl-fixed", "object": "chat.completion", "created": 1, "model": "gpt-4o", "choices": [] });
+    openai.answer(Answer::body(body.clone()));
+    let r = chat(&openai, hi("gpt-4o")).await;
+    assert_eq!(
+        (r.status, r.body.as_str()),
+        (200, body.to_string().as_str())
+    );
+    assert_eq!(r.header("content-type"), Some("application/json"));
+
+    let raw = "{ \"id\": \"chatcmpl-fixed\",\n  \"created\": 1 }";
+    openai.answer(Answer::raw(raw));
+    let r = chat(&openai, hi("gpt-4o")).await;
+    assert_eq!((r.status, r.body.as_str()), (200, raw));
+    assert_eq!(r.header("content-type"), Some("application/json"));
+}
+
+#[tokio::test]
+async fn raw_events_can_be_raw_lines() {
+    let openai = FakeOpenAi::start().await;
+    let events = vec![json!({ "custom": 1 }), json!("data: [DONE]")];
+    openai.answer(Answer::events(events));
+    let r = chat(&openai, with(hi("gpt-4o"), json!({ "stream": true }))).await;
+    assert_eq!(r.body, "data: {\"custom\":1}\n\ndata: [DONE]\n\n");
+}
+
+#[tokio::test]
+async fn answers_set_headers_and_error_messages() {
+    let openai = FakeOpenAi::start().await;
+    openai.answer(
+        Answer::text("Hi")
+            .header("x-custom", "1")
+            .header("x-request-id", "req_mine"),
+    );
+    let r = chat(&openai, hi("gpt-4o")).await;
+    assert_eq!(r.header("x-custom"), Some("1"));
+    assert_eq!(r.header("x-request-id"), Some("req_mine"));
+
+    openai.answer(
+        Answer::error(429)
+            .message("Too fast.")
+            .header("x-ratelimit-remaining-requests", "0"),
+    );
+    let r = chat(&openai, hi("gpt-4o")).await;
+    assert_eq!(r.status, 429);
+    assert_eq!(r.header("x-ratelimit-remaining-requests"), Some("0"));
+    let e = &r.json()["error"];
+    assert_eq!(
+        (&e["message"], &e["type"], &e["code"]),
+        (
+            &json!("Too fast."),
+            &json!("requests"),
+            &json!("rate_limit_exceeded")
+        )
+    );
+
+    openai.answer(Answer::raw("plain").header("content-type", "text/plain"));
+    let r = chat(&openai, hi("gpt-4o")).await;
+    assert_eq!(
+        (r.header("content-type"), r.body.as_str()),
+        (Some("text/plain"), "plain")
+    );
+}

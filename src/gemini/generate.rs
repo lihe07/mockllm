@@ -5,6 +5,7 @@
 //!
 //! Error wording the docs do not give is the wording commonly seen.
 
+use crate::transport::framed;
 use serde_json::{Value, json};
 
 use super::generate_models::{BASE, MODELS};
@@ -108,7 +109,7 @@ impl Endpoint<Gemini> for Generate {
         let error = gemini.error(&gemini.scripted(500), 0).to_string();
         let parts: Vec<Value> = match (&answer.reply, answer.reply.text()) {
             (Reply::Events(events), _) if self.stream => {
-                return Out::Sse(events.iter().map(frame).collect(), error);
+                return Out::Sse(events.iter().map(|e| framed(e, frame)).collect(), error);
             }
             (_, Some("")) => vec![json!({ "text": "" })],
             (_, Some(t)) => words(t).into_iter().map(|w| json!({ "text": w })).collect(),

@@ -1,6 +1,7 @@
 //! OpenAI Chat Completions: `POST /v1/chat/completions`.
 //! https://developers.openai.com/api/reference/resources/chat
 
+use crate::transport::framed;
 use serde_json::{Map, Value, json};
 
 use super::chat_models::{Allowed, BASE, MODELS, Model};
@@ -209,7 +210,7 @@ fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
         (_, Some(t)) => (words(t), None),
         (Reply::ToolCall { name, args }, _) => (Vec::new(), Some((name, args.to_string()))),
         (Reply::Events(events), _) if streaming => {
-            return Out::Sse(events.iter().map(data).collect(), error);
+            return Out::Sse(events.iter().map(|e| framed(e, data)).collect(), error);
         }
         (other, _) => return misfit("chat completions", other),
     };
