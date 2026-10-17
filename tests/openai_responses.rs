@@ -213,7 +213,10 @@ async fn reasoning_models_answer_a_reasoning_item_first() {
         (&rs["type"], &rs["summary"]),
         (&json!("reasoning"), &json!([]))
     );
-    assert!(rs["encrypted_content"].is_string());
+    assert!(
+        rs.get("encrypted_content").is_none(),
+        "only when included: {rs}"
+    );
     assert_eq!(v["output"][1]["type"], "message");
     assert_eq!(v["usage"]["output_tokens_details"]["reasoning_tokens"], 3);
     assert_eq!(v["usage"]["output_tokens"], 4);
@@ -256,6 +259,112 @@ async fn reasoning_models_answer_a_reasoning_item_first() {
     let v = create(&openai, hi("gpt-4o")).await.json();
     assert_eq!(v["output"].as_array().unwrap().len(), 1);
     assert_eq!(v["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
+}
+
+#[tokio::test]
+async fn encrypted_reasoning_comes_when_included() {
+    let openai = FakeOpenAi::start().await;
+    openai.answer(Answer::text("Hi").reasoning("one two"));
+    let body = with(
+        hi("o3"),
+        json!({ "include": ["reasoning.encrypted_content"] }),
+    );
+    let v = create(&openai, body.clone()).await.json();
+    assert!(v["output"][0]["encrypted_content"].is_string(), "{v}");
+
+    openai.answer(Answer::text("Hi").reasoning("one two"));
+    let all = events(&create(&openai, streamed(body)).await);
+    let done = all
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done")
+        .unwrap();
+    assert!(done["item"]["encrypted_content"].is_string(), "{done}");
+}
+
+/// A reasoning model's call, stateless: the call's `function_call` and
+/// `reasoning` items, as the response gave them.
+async fn reasoned_call(openai: &FakeOpenAi, store: bool) -> (Value, Value) {
+    openai.answer(Answer::tool_call("f", json!({})).reasoning("think"));
+    let body = with(
+        hi("o3"),
+        json!({ "store": store, "include": ["reasoning.encrypted_content"] }),
+    );
+    let v = create(openai, body).await.json();
+    let output = v["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "reasoning", "{v}");
+    assert_eq!(output[1]["type"], "function_call", "{v}");
+    (output[0].clone(), output[1].clone())
+}
+
+#[tokio::test]
+async fn a_reasoned_call_needs_its_reasoning_item_back() {
+    let openai = FakeOpenAi::start().await;
+    let (rs, fc) = reasoned_call(&openai, true).await;
+    let user = json!({ "role": "user", "content": "say hi" });
+    let output =
+        json!({ "type": "function_call_output", "call_id": fc["call_id"], "output": "ok" });
+    let next = |input: Value| json!({ "model": "o3", "input": input });
+
+    let r = create(&openai, next(json!([user, fc, output]))).await;
+    let says = format!(
+        "Item '{}' of type 'function_call' was provided without its required 'reasoning' item: '{}'.",
+        fc["id"].as_str().unwrap(),
+        rs["id"].as_str().unwrap()
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.error().1.contains(&says), "{}", r.body);
+
+    // With it before the call, or the call without its id, it is taken.
+    let r = create(&openai, next(json!([user, rs, fc, output]))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let mut bare = fc.clone();
+    bare.as_object_mut().unwrap().remove("id");
+    let r = create(&openai, next(json!([user, bare, output]))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    // A model that does not reason makes calls of no reasoning.
+    openai.answer(Answer::tool_call("f", json!({})).reasoning("think"));
+    let v = create(&openai, hi("gpt-4o")).await.json();
+    let fc = v["output"][0].clone();
+    let output =
+        json!({ "type": "function_call_output", "call_id": fc["call_id"], "output": "ok" });
+    let r = create(&openai, next(json!([user, fc, output]))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+#[tokio::test]
+async fn unstored_reasoning_comes_back_encrypted() {
+    let openai = FakeOpenAi::start().await;
+    let (rs, fc) = reasoned_call(&openai, false).await;
+    let user = json!({ "role": "user", "content": "say hi" });
+    let output =
+        json!({ "type": "function_call_output", "call_id": fc["call_id"], "output": "ok" });
+    let next = |input: Value| json!({ "model": "o3", "store": false, "input": input });
+
+    let r = create(&openai, next(json!([user, rs, fc, output]))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    let mut plain = rs.clone();
+    plain.as_object_mut().unwrap().remove("encrypted_content");
+    let r = create(&openai, next(json!([user, plain, fc, output]))).await;
+    assert_eq!(r.status, 404, "{}", r.body);
+    assert_eq!(r.json()["error"]["param"], "input");
+    assert!(
+        r.error()
+            .1
+            .contains("Items are not persisted when `store` is set to false"),
+        "{}",
+        r.body
+    );
+
+    // A stored response's reasoning is found by its id alone.
+    let (rs, fc) = reasoned_call(&openai, true).await;
+    let mut plain = rs.clone();
+    plain.as_object_mut().unwrap().remove("encrypted_content");
+    let output =
+        json!({ "type": "function_call_output", "call_id": fc["call_id"], "output": "ok" });
+    let r = create(&openai, next(json!([user, plain, fc, output]))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 #[tokio::test]

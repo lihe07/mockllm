@@ -45,7 +45,7 @@ impl Provider for OpenAi {
             Box::new(embeddings::Embeddings),
             Box::new(images::Images),
             Box::new(realtime::Realtime),
-            Box::new(responses::Responses),
+            Box::new(responses::Responses::default()),
             Box::new(speech::Speech),
             Box::new(transcriptions::Transcriptions),
             Box::new(image_edits::ImageEdits),

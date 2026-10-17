@@ -179,14 +179,19 @@ status, `retry-after`.
   `input` a string or items, message roles, `function_call` and
   `function_call_output` items paired by `call_id` (an output may answer a
   stored call with `previous_response_id` or `conversation`), function
-  tools with a top-level `name`; per-model rules from the Chat Completions
+  tools with a top-level `name`; the reasoning items it made, sent back
+  statelessly: a reasoning model's `function_call` needs the `reasoning`
+  item it came after (400, "provided without its required 'reasoning'
+  item"), and a `store: false` response's `reasoning` item needs its
+  `encrypted_content` (404, "Items are not persisted"); per-model rules from the Chat Completions
   table (`max_output_tokens`, `reasoning.effort` values, sampling and
   `message.output_text.logprobs` only where the model allows, per the
   [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model)).
   The Response object echoing the request's settings with their defaults;
   `message` items with `output_text`, `function_call` items (`fc_` id,
   `call_id`), a `reasoning` item first on reasoning models (`summary` only
-  with `reasoning.summary`, `encrypted_content`), usage with
+  with `reasoning.summary`, `encrypted_content` only with `include:
+  ["reasoning.encrypted_content"]`), usage with
   `reasoning_tokens`. Streaming as named events (`event: <type>`) with
   `sequence_number` from 0: `response.created`, `response.in_progress`,
   `output_item.added`/`.done`, `content_part.*`, `output_text.delta`/`.done`,

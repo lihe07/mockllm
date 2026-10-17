@@ -7,6 +7,9 @@
 //! wording the docs do not give is the wording commonly seen from the API,
 //! marked "(commonly seen)". "CREATE" in comments is the first URL above.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use crate::transport::framed;
 use serde_json::{Map, Value, json};
 
@@ -41,7 +44,8 @@ const INCLUDABLE: &[&str] = &[
 /// Roles of an input message (`EasyInputMessage`), same source.
 const ROLES: &[&str] = &["user", "assistant", "system", "developer"];
 
-pub(crate) struct Responses;
+#[derive(Default)]
+pub(crate) struct Responses(Made);
 
 impl Endpoint<OpenAi> for Responses {
     fn route(&self) -> (&'static str, &'static str) {
@@ -49,15 +53,36 @@ impl Endpoint<OpenAi> for Responses {
     }
 
     fn validate(&self, _: &OpenAi, req: &Request) -> Result<(), Rejection> {
-        validate(req)
+        validate(req, &self.0.lock())
     }
 
     fn respond(&self, openai: &OpenAi, req: &Request, answer: &Answer, ctx: &Ctx) -> Out {
-        respond(openai, req, answer, ctx.id)
+        respond(openai, req, answer, ctx.id, &self.0)
     }
 }
 
-fn validate(req: &Request) -> Result<(), Rejection> {
+/// The reasoning items the mock answered with, and what a client sending
+/// them back as input must do, as the real API checks it of the items it
+/// made.
+#[derive(Clone, Debug, Default)]
+struct Made(Arc<Mutex<Ledger>>);
+
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Function call item ids, each with the reasoning item before it.
+    reasoned: HashMap<String, String>,
+    /// Reasoning item ids of `store: false` responses, which the API keeps
+    /// no copy of.
+    unstored: HashSet<String>,
+}
+
+impl Made {
+    fn lock(&self) -> MutexGuard<'_, Ledger> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn validate(req: &Request, made: &Ledger) -> Result<(), Rejection> {
     let body = object(req, KNOWN)?;
     let set = |p: &str| body.get(p).filter(|v| !v.is_null());
     // `model` is optional in the reference only because a `prompt`
@@ -105,7 +130,10 @@ fn validate(req: &Request) -> Result<(), Rejection> {
     let stateful = set("previous_response_id").is_some() || set("conversation").is_some();
     match set("input") {
         None | Some(Value::String(_)) => {}
-        Some(Value::Array(items)) => check_input(items, stateful)?,
+        Some(Value::Array(items)) => {
+            check_input(items, stateful)?;
+            check_reasoning(items, stateful, made)?;
+        }
         Some(_) => {
             let message = "Invalid type for 'input': expected one of a string or array of input items, but got an object instead.";
             return Err(bad(message, Some("input"), Some("invalid_type")));
@@ -194,6 +222,46 @@ fn check_input(items: &[Value], stateful: bool) -> Result<(), Rejection> {
     }
 }
 
+/// The reasoning items the mock made, sent back. A reasoning model's
+/// function call needs the reasoning item that came before it (commonly
+/// seen: "provided without its required 'reasoning' item"), unless the
+/// context is stored (`previous_response_id`, `conversation`). A reasoning
+/// item of a `store: false` response is not kept, so it needs its
+/// `encrypted_content` (commonly seen: "Items are not persisted when
+/// `store` is set to false").
+fn check_reasoning(items: &[Value], stateful: bool, made: &Ledger) -> Result<(), Rejection> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in items {
+        let id = item["id"].as_str().unwrap_or_default();
+        match item["type"].as_str().unwrap_or_default() {
+            "reasoning" => {
+                let encrypted = item["encrypted_content"].is_string();
+                if made.unstored.contains(id) && !encrypted {
+                    let message = format!(
+                        "Item with id '{id}' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."
+                    );
+                    return Err(Rejection::new(404, message).param("input"));
+                }
+                seen.insert(id);
+            }
+            "function_call" if !stateful => {
+                if let Some(rs) = made
+                    .reasoned
+                    .get(id)
+                    .filter(|rs| !seen.contains(rs.as_str()))
+                {
+                    let message = format!(
+                        "Item '{id}' of type 'function_call' was provided without its required 'reasoning' item: '{rs}'."
+                    );
+                    return Err(bad(message, Some("input"), None));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A function tool has a top-level `name` (`FunctionTool`: CREATE), not
 /// Chat Completions' nested `function` (commonly seen wording).
 fn check_tools(tools: Option<&Value>) -> Result<(), Rejection> {
@@ -274,7 +342,7 @@ struct Item {
     events: Vec<Value>,
 }
 
-fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
+fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64, made: &Made) -> Out {
     let Some(body) = req.object() else {
         return Out::Misfit("mockllm: validated body is not an object".into());
     };
@@ -309,11 +377,14 @@ fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
 
     let mut items = Vec::new();
     // Reasoning models answer with a `reasoning` item first; its
-    // `summary` is shown only when `reasoning.summary` is asked, and
-    // `encrypted_content` "is populated by default": CREATE (Reasoning).
+    // `summary` is shown only when `reasoning.summary` is asked, and its
+    // `encrypted_content` is "populated when a response is generated with
+    // `reasoning.encrypted_content` in the `include` parameter": CREATE
+    // (Reasoning).
     let thought = answer.reasoning.as_deref().map(words).unwrap_or_default();
     let reasoning = if model.reasoning { thought.len() } else { 0 } as u64;
-    if model.reasoning && !thought.is_empty() {
+    let reasoned = model.reasoning && !thought.is_empty();
+    if reasoned {
         let id = format!("rs_fake{n}");
         let text = thought.concat();
         let summarized = !at(body, "reasoning")["summary"].is_null();
@@ -337,9 +408,18 @@ fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
                 json!({ "type": "response.reasoning_summary_part.done", "part": summary[0] }),
             ));
         }
+        let mut done = json!({ "id": id, "type": "reasoning", "summary": summary });
+        let include = at(body, "include").as_array().cloned().unwrap_or_default();
+        if include.iter().any(|v| v == "reasoning.encrypted_content") {
+            done["encrypted_content"] = format!("gAAAAfake{n}").into();
+        }
+        // "Defaults to true when omitted": CREATE (store).
+        if body.get("store") == Some(&Value::Bool(false)) {
+            made.lock().unstored.insert(id.clone());
+        }
         items.push(Item {
             added: json!({ "id": id, "type": "reasoning", "summary": [] }),
-            done: json!({ "id": id, "type": "reasoning", "summary": summary, "encrypted_content": format!("gAAAAfake{n}") }),
+            done,
             events,
         });
     }
@@ -373,6 +453,11 @@ fn respond(openai: &OpenAi, req: &Request, answer: &Answer, n: u64) -> Out {
         }
         (Reply::ToolCall { name, args }, _) => {
             let (id, args) = (format!("fc_fake{n}"), args.to_string());
+            if reasoned {
+                made.lock()
+                    .reasoned
+                    .insert(id.clone(), format!("rs_fake{n}"));
+            }
             let item = |status: &str, args: &str| json!({ "id": id, "type": "function_call", "status": status, "arguments": args, "call_id": format!("call_fake{n}"), "name": name });
             let parts = pieces(&args, 8);
             let mut events: Vec<Value> = parts
